@@ -16,7 +16,7 @@ The point isn't to find a single "best" trader. It's the opposite: by giving ten
 - [Decision pipeline](#decision-pipeline)
 - [Self-resolving settlement](#self-resolving-settlement)
 - [Rate-limit strategy](#rate-limit-strategy)
-- [Quorum, equivocation, and outage resilience](#quorum-equivocation-and-outage-resilience)
+  - [Peer reasoning cache binding to claim statement digest](#peer-reasoning-cache-binding-to-claim-statement-digest)
 - [Local setup](#local-setup)
 - [Production deploy](#production-deploy)
 - [Configuration reference](#configuration-reference)

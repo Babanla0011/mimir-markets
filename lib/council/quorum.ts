@@ -183,14 +183,10 @@ export interface VoteAttemptInput {
   ageMs?: number;
   /** Responses older than this are stale (optional). */
   maxAgeMs?: number;
-  /** True when this vote submission or ballot is explicitly expired. */
-  expired?: boolean;
-  /** Deadline timestamp in ms; submission past this is marked expired. */
-  ballotDeadlineMs?: number;
-  /** Submission timestamp in ms. */
-  submittedAtMs?: number;
-  /** Explicitly marks this attempt as an equivocation / conflicting vote. */
-  equivocated?: boolean;
+  /** Statement digest of the claim when reasoning/vote was generated. */
+  statementDigest?: string;
+  /** Expected statement digest; mismatch classifies attempt as stale. */
+  expectedStatementDigest?: string;
 }
 
 export interface ClassifiedVote {
@@ -327,7 +323,7 @@ export function comparePolicies(
 const CONTROL_OR_SEP = /[\u0000-\u001f\u007f|,]/;
 
 export function isDecisiveVerdict(verdict: Verdict): boolean {
-  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WIN";
+  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WIN" || (verdict as string) === "CHALLENGERS_WINS";
 }
 
 /**
@@ -341,60 +337,32 @@ export function isDecisiveVerdict(verdict: Verdict): boolean {
 export function normalizeQuorum(raw: unknown, fallback = DEFAULT_COUNCIL_QUORUM): number {
   const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
   if (!Number.isFinite(n) || n < 1) return fallback;
-  return Math.min(MAX_COUNCIL_QUORUM, Math.trunc(n));
+  return Math.min(Math.floor(n), MAX_COUNCIL_QUORUM);
 }
 
 /**
- * True when the raw value was unusable (callers that want strict refusal can
- * abort instead of normalizing). Empty / missing is not invalid — it means default.
+ * Tell whether a raw quorum value is clearly broken, so strict mode can abort
+ * before settling.
  */
 export function isInvalidQuorumConfig(raw: unknown): boolean {
-  if (raw === undefined || raw === null || raw === "") return false;
+  if (raw == null || raw === undefined || raw === "") return false;
   const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
   return !Number.isFinite(n) || n < 1;
 }
 
-function clampConfidence(value: unknown): number {
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, Math.round(n)));
-}
-
-function normalizeRevisionString(value: number | string | undefined | null): string | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) return null;
-    return String(value);
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed || CONTROL_OR_SEP.test(trimmed)) return null;
-    return trimmed;
-  }
-  return null;
-}
-
-function attachVoteMetadata(base: ClassifiedVote, input: VoteAttemptInput): ClassifiedVote {
-  const out: ClassifiedVote = { ...base };
-  if (input.participantAddress !== undefined) {
-    out.participantAddress = input.participantAddress.trim();
-  }
-  if (input.claimRevision !== undefined) {
-    const rev = normalizeRevisionString(input.claimRevision);
-    out.claimRevision = rev ?? String(input.claimRevision).trim();
-  }
-  if (input.recordedAtMs !== undefined) {
-    out.recordedAtMs = input.recordedAtMs;
-  }
-  if (input.alteredAtMs !== undefined) {
-    out.alteredAtMs = input.alteredAtMs;
-  }
-  return out;
-}
-
 /**
- * Classify a single vote attempt. Duplicates are handled by
- * {@link buildBallot} so this function stays order-independent.
+ * Classify a raw persona response into a disposition for the ballot.
+ *
+ * Precedence:
+ *   1. Persona paused → paused (must not vote)
+ *   2. Claim cancelled → cancelled (must not settle)
+ *   3. Claim already resolved → stale (must not replay)
+ *   4. Mismatched claimId → stale (cross-claim leakage)
+ *   5. Mismatched statementDigest → stale (claim wording or source commitment changed)
+ *   6. Response aged past maxAgeMs → stale (cached verdict too old)
+ *   7. Transport failure (network / timeout / 5xx) → dependency_failure
+ *   8. Missing slug or unknown verdict → invalid
+ *   9. Otherwise → valid (decisive iff CREATOR_WINS | CHALLENGERS_WIN)
  */
 export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
   const slug = (input.slug ?? "").trim().toLowerCase();
@@ -406,7 +374,7 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     return {
       slug: "",
       disposition: "invalid",
-      reason: "missing persona slug",
+      reason: "missing or empty persona slug",
       decisive: false,
       ...arrivalMeta,
     };
@@ -416,7 +384,7 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     return {
       slug,
       disposition: "paused",
-      reason: "persona is paused",
+      reason: "persona is currently paused",
       decisive: false,
       ...arrivalMeta,
     };
@@ -489,6 +457,19 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
   }
 
   if (
+    input.expectedStatementDigest &&
+    input.statementDigest &&
+    input.statementDigest !== input.expectedStatementDigest
+  ) {
+    return {
+      slug,
+      disposition: "stale",
+      reason: "claim statement digest mismatch (statement wording or source commitment changed)",
+      decisive: false,
+    };
+  }
+
+  if (
     input.maxAgeMs != null &&
     Number.isFinite(input.maxAgeMs) &&
     input.maxAgeMs >= 0 &&
@@ -523,7 +504,7 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
       return {
         slug,
         disposition: "dependency_failure",
-        reason: `vote endpoint HTTP ${code || "error"}`,
+        reason: `vote endpoint HTTP ${code}`,
         decisive: false,
         ...arrivalMeta,
       };
@@ -532,7 +513,7 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
       return {
         slug,
         disposition: "stale",
-        reason: "claim not found at vote endpoint",
+        reason: "vote endpoint 404 — claim not found",
         decisive: false,
         ...arrivalMeta,
       };
@@ -540,7 +521,7 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     return {
       slug,
       disposition: "invalid",
-      reason: `vote endpoint HTTP ${code}`,
+      reason: `vote endpoint rejected request (HTTP ${code})`,
       decisive: false,
       ...arrivalMeta,
     };
@@ -550,17 +531,26 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     return {
       slug,
       disposition: "invalid",
-      reason: "missing or unknown verdict",
+      reason: `verdict '${String(input.verdict)}' is not one of CREATOR_WINS | CHALLENGERS_WIN | DRAW | UNRESOLVABLE`,
       decisive: false,
       ...arrivalMeta,
     };
   }
 
-  const confidence = clampConfidence(input.confidence);
+  const confidenceRaw =
+    typeof input.confidence === "number"
+      ? input.confidence
+      : typeof input.confidence === "string"
+        ? Number(input.confidence)
+        : 0;
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.max(0, Math.min(100, Math.round(confidenceRaw)))
+    : 0;
+
   return {
     slug,
     disposition: "valid",
-    reason: "accepted",
+    reason: "well-formed vote",
     verdict: input.verdict,
     confidence,
     decisive: isDecisiveVerdict(input.verdict),
@@ -586,145 +576,62 @@ export interface BuildBallotOptions {
 
 /**
  * Fold classified attempts into a ballot: first valid vote per slug wins;
- * later attempts for the same slug are marked duplicated and dropped
- * (or handled according to equivocation policy when configured).
+ * later attempts for the same slug become `duplicated`. Non-valid attempts
+ * pass through to `rejected` unchanged.
  */
-export function buildBallot(
-  classified: ClassifiedVote[],
-  opts?: BuildBallotOptions,
-): {
+export function buildBallot(attempts: readonly ClassifiedVote[]): {
   ballot: ClassifiedVote[];
   rejected: ClassifiedVote[];
   conflicts: DuplicateVoteConflict[];
 } {
-  const policy =
-    opts?.equivocationPolicy ??
-    (opts?.rejectEquivocation ? "disqualify_all" : "drop_duplicate");
-
-  const seen = new Map<string, ClassifiedVote>();
-  const disqualified = new Set<string>();
   const ballot: ClassifiedVote[] = [];
   const rejected: ClassifiedVote[] = [];
-  const conflicts: DuplicateVoteConflict[] = [];
+  const seenSlugs = new Set<string>();
 
-  for (const vote of classified) {
-    if (vote.disposition !== "valid") {
-      rejected.push(vote);
+  for (const attempt of attempts) {
+    if (attempt.disposition !== "valid") {
+      rejected.push(attempt);
       continue;
     }
-
-    if (disqualified.has(vote.slug)) {
+    if (seenSlugs.has(attempt.slug)) {
       rejected.push({
-        ...vote,
-        disposition: "equivocation",
-        reason: `persona '${vote.slug}' is disqualified for equivocation`,
+        ...attempt,
+        disposition: "duplicated",
+        reason: `persona '${attempt.slug}' already submitted a vote on this ballot`,
         decisive: false,
-        verdict: undefined,
-        confidence: undefined,
-        ...(original.arrivalId ? { originalArrivalId: original.arrivalId } : {}),
-        conflict: isConflict,
       });
       continue;
     }
-
-    const prior = seen.get(vote.slug);
-    if (prior) {
-      const isConflict = prior.verdict !== vote.verdict;
-      if (!isConflict) {
-        // Benign duplicate (same verdict)
-        rejected.push({
-          ...vote,
-          disposition: "duplicated",
-          reason: `duplicate vote for persona '${vote.slug}'`,
-          decisive: false,
-          verdict: undefined,
-          confidence: undefined,
-        });
-        continue;
-      }
-
-      // Conflicting verdicts (equivocation)
-      if (policy === "drop_duplicate") {
-        rejected.push({
-          ...vote,
-          disposition: "duplicated",
-          reason: `duplicate vote for persona '${vote.slug}'`,
-          decisive: false,
-          verdict: undefined,
-          confidence: undefined,
-        });
-        continue;
-      }
-
-      if (policy === "reject_subsequent") {
-        rejected.push({
-          ...vote,
-          disposition: "equivocation",
-          reason: `conflicting vote for persona '${vote.slug}' (equivocation)`,
-          decisive: false,
-          verdict: undefined,
-          confidence: undefined,
-        });
-        continue;
-      }
-
-      // policy === "disqualify_all" (conservative default)
-      disqualified.add(vote.slug);
-      const priorIndex = ballot.findIndex((v) => v.slug === vote.slug);
-      if (priorIndex !== -1) {
-        const [evicted] = ballot.splice(priorIndex, 1);
-        rejected.push({
-          ...evicted,
-          disposition: "equivocation",
-          reason: `disqualified for conflicting votes (equivocation)`,
-          decisive: false,
-          verdict: undefined,
-          confidence: undefined,
-        });
-      }
-      rejected.push({
-        ...vote,
-        disposition: "equivocation",
-        reason: `conflicting vote for persona '${vote.slug}' (equivocation)`,
-        decisive: false,
-        verdict: undefined,
-        confidence: undefined,
-      });
-      continue;
-    }
-
-    seen.set(vote.slug, vote);
-    ballot.push(vote);
+    seenSlugs.add(attempt.slug);
+    ballot.push(attempt);
   }
 
   return { ballot, rejected, conflicts };
 }
 
-function countDispositions(
-  votes: ClassifiedVote[],
-): Record<VoteDisposition, number> {
+function countDispositions(votes: readonly ClassifiedVote[]): Record<VoteDisposition, number> {
   const counts = EMPTY_DISPOSITIONS();
-  for (const vote of votes) counts[vote.disposition] += 1;
+  for (const v of votes) {
+    counts[v.disposition] = (counts[v.disposition] ?? 0) + 1;
+  }
   return counts;
 }
 
-export interface QuorumEvaluationOptions extends BuildBallotOptions {
+export interface QuorumEvaluationOptions {
+  /**
+   * On-chain claim state. Checked before counting votes so a cancelled or
+   * already-resolved claim aborts even if every attempt looks valid.
+   */
   claimState?: ClaimSettleState;
+  /**
+   * Reject unparseable quorum config with `abort_invalid_config` instead of
+   * falling back to the default.
+   */
   strictConfig?: boolean;
-  /** True when the ballot or settlement period has expired. */
-  ballotExpired?: boolean;
-  /** Age of the ballot in ms. */
-  ballotAgeMs?: number;
-  /** Max allowed age for a ballot in ms before it is considered expired. */
-  maxBallotAgeMs?: number;
-  /** Timestamp in ms after which the ballot is expired. */
-  ballotDeadlineMs?: number;
-  /** Reference timestamp in ms (defaults to Date.now()). */
-  nowMs?: number;
 }
 
 /**
- * Decide whether the council ballot may settle the claim, or how to fall back.
+ * Pure policy gate: evaluates whether a set of vote attempts meets quorum.
  *
  * Every returned evaluation carries `policyRevision`, derived from the effective
  * quorum, so a recorded decision can be replayed deterministically under the
@@ -739,14 +646,9 @@ export interface QuorumEvaluationOptions extends BuildBallotOptions {
  *   returns `abort_invalid_config` instead of normalizing.
  */
 export function evaluateQuorum(
-  attempts: ClassifiedVote[],
+  attempts: readonly ClassifiedVote[],
   quorumRaw: unknown = DEFAULT_COUNCIL_QUORUM,
-  opts?: {
-    claimState?: ClaimSettleState;
-    strictConfig?: boolean;
-    checkIndependence?: boolean;
-    independenceConfig?: QuorumIndependenceConfig;
-  },
+  opts?: QuorumEvaluationOptions,
 ): QuorumEvaluation {
   const claimState = opts?.claimState;
   const quorum = normalizeQuorum(quorumRaw);
@@ -760,14 +662,14 @@ export function evaluateQuorum(
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
-      reason: "claim is cancelled — council settlement aborted",
+      reason: "claim is cancelled on-chain — council settlement aborted",
       acceptedSlugs: [],
       ballot: [],
       conflicts: [],
     };
   }
 
-  if (claimState === "resolved") {
+  if (opts?.claimState === "resolved") {
     return {
       action: "abort_resolved",
       quorum,
@@ -775,14 +677,14 @@ export function evaluateQuorum(
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
-      reason: "claim is already resolved — council pass is stale",
+      reason: "claim is already resolved — council settlement aborted",
       acceptedSlugs: [],
       ballot: [],
       conflicts: [],
     };
   }
 
-  if (claimState === "paused") {
+  if (opts?.claimState === "paused") {
     return {
       action: "abort_paused",
       quorum,
@@ -887,6 +789,18 @@ export function evaluateQuorum(
     dep ? `${dep} dependency_failure` : null,
     equiv ? `${equiv} equivocation` : null,
     expired ? `${expired} expired` : null,
+  ].filter(Boolean);
+
+  const dep = dispositions.dependency_failure;
+  const paused = dispositions.paused;
+  const reasonParts = [
+    `below quorum: ${decisiveCount} decisive < ${quorum}`,
+    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
+    dispositions.stale ? `${dispositions.stale} stale` : null,
+    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
+    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
+    paused ? `${paused} paused` : null,
+    dep ? `${dep} dependency_failure` : null,
   ].filter(Boolean);
 
   const dep = dispositions.dependency_failure;

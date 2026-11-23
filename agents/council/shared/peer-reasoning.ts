@@ -126,8 +126,14 @@ export function setCachedPeerReasoning(
   statementDigest = "",
   nowMs = Date.now(),
 ): void {
+  // Clear any existing entries for this claimId and buyerSlug so old digests are replaced
+  for (const [key, value] of persistentPeerReasoningCache) {
+    if (value.claimId === claimId && value.buyerSlug === buyerSlug) {
+      persistentPeerReasoningCache.delete(key);
+    }
+  }
+
   const key = peerReasoningCacheKey(claimId, buyerSlug, statementDigest);
-  persistentPeerReasoningCache.delete(key);
   persistentPeerReasoningCache.set(key, {
     claimId,
     buyerSlug,
@@ -995,29 +1001,8 @@ export async function buyPeerReasoning(args: {
 }): Promise<PeerReadOutcome[]> {
   if (args.readsPerPersona <= 0) return [];
 
-  if (!args.skipCache && statementDigest) {
-    const cached = getCachedPeerReasoning(args.claimId, args.buyer.slug, statementDigest);
-    if (cached && cached.length > 0) {
-      return {
-        reads: cached,
-        outages: [],
-        conflicts: [],
-        remainingUnits: capUnits,
-        totalPaidUnits: 0n,
-      };
-    }
-  }
-
-  const payer =
-    args.payer !== undefined
-      ? args.payer
-      : payingWalletForPersona(args.buyer);
-  if (!payer) return emptyOutcome;
-
-  const doFetch = args.fetchWithBudgetImpl ?? fetchWithBudget;
-  const sleep =
-    args.sleepFn ??
-    ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const statementDigest =
+    args.statementDigest ?? (args.claim ? claimStatementDigest(args.claim) : undefined);
 
   const policyRevision = args.policyRevision ?? PEER_REASONING_POLICY_REVISION;
   const sellers = selectPeerSellers(

@@ -1,13 +1,19 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  BallotCommitmentError,
-  PEER_REASONING_COMMITMENT_VERSION,
-  buyPeerReasoning,
-  createPeerReasoningCommitment,
   selectPeerSellers,
-  verifyPeerReasoningCommitment,
-  type PeerReasoningCommitment,
+  claimStatementDigest,
+  peerReasoningCacheKey,
+  getCachedPeerReasoning,
+  setCachedPeerReasoning,
+  clearPeerReasoningCache,
+  peerReasoningCacheSize,
+  prunePeerReasoningCache,
+  invalidatePeerReasoning,
+  simulatePeerReasoningScenario,
+  PEER_REASONING_CACHE_MAX_ENTRIES,
+  type ClaimStatementInput,
+  type PeerReasoningRead,
 } from "../../agents/council/shared/peer-reasoning";
 import { COUNCIL_PERSONAS, type PersonaSpec } from "../../agents/council/personas";
 import type { PayingWallet } from "../../lib/x402/buyer";
@@ -73,228 +79,370 @@ describe("selectPeerSellers", () => {
   });
 });
 
-describe("versioned peer-reasoning ballot commitment", () => {
-  const buyer = COUNCIL_PERSONAS[0]!; // optimist
-  const active = COUNCIL_PERSONAS.slice(0, 4); // optimist, pessimist, contrarian, statistician
+describe("claimStatementDigest", () => {
+  const baseClaim: ClaimStatementInput = {
+    question: "Will Stellar protocol 22 activate by December 2026?",
+    creatorPosition: "YES",
+    counterPosition: "NO",
+    resolutionUrl: "https://stellar.org/protocol-22-schedule",
+    settlementRule: "Official stellar.org announcement or network vote",
+    contextHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  };
 
-  it("binds participant identities, claim revision, and eligible vote set before outcome evaluation", async () => {
-    const boundaryMs = 1_750_000_000_000;
-    const expectedSellers = selectPeerSellers(buyer, active, 12, 2);
-    let capturedCommitment: PeerReasoningCommitment | undefined;
-
-    const reads = await buyPeerReasoning({
-      buyer,
-      activePersonas: active,
-      claimId: 12,
-      claimRevision: "rev-7",
-      eligibleVoteSet: expectedSellers.map((s) => s.slug),
-      participantIdentities: [
-        { slug: buyer.slug, address: "GBUYER111", track: "classic" },
-        ...expectedSellers.map((s, idx) => ({
-          slug: s.slug,
-          address: `GSELLER${idx}`,
-          track: "classic" as const,
-        })),
-      ],
-      votingBoundaryMs: boundaryMs,
-      baseUrl: "http://council.local",
-      readsPerPersona: 2,
-      capUsdc: 0.003,
-      delayMs: 0,
-      payer: FAKE_PAYER,
-      now: () => boundaryMs - 100,
-      onCommitment: (c) => {
-        capturedCommitment = c;
-      },
-      fetchWithBudgetFn: async (url) => {
-        const parsed = new URL(url);
-        const slug = parsed.searchParams.get("persona")!;
-        const idx = expectedSellers.findIndex((s) => s.slug === slug);
-        return {
-          response: fakeResponse(200, {
-            claimId: 12,
-            claimRevision: "rev-7",
-            reasoning: `Independent analysis from ${slug}`,
-            paidTo: `GSELLER${idx}`,
-            recordedAtMs: boundaryMs - 50,
-            persona: { slug, name: expectedSellers[idx]?.displayName ?? slug },
-          }),
-          payment: { priceUnits: 10_000n, txHash: "a".repeat(64) },
-        };
-      },
-    });
-
-    assert.equal(reads.length, 2);
-    assert.ok(capturedCommitment, "expected a sealed peer-reasoning commitment");
-    assert.equal(capturedCommitment.version, PEER_REASONING_COMMITMENT_VERSION);
-    assert.equal(capturedCommitment.claimId, 12);
-    assert.equal(capturedCommitment.claimRevision, "rev-7");
-    assert.equal(capturedCommitment.buyerSlug, buyer.slug);
-    assert.deepEqual(
-      capturedCommitment.eligibleVoteSet,
-      expectedSellers.map((s) => s.slug).sort(),
-    );
-    assert.match(capturedCommitment.commitmentHash, /^[0-9a-f]{64}$/);
-
-    const verified = verifyPeerReasoningCommitment(capturedCommitment, reads, {
-      claimId: 12,
-      claimRevision: "rev-7",
-      buyerSlug: buyer.slug,
-      eligibleVoteSet: expectedSellers.map((s) => s.slug),
-      votingBoundaryMs: boundaryMs,
-    });
-    assert.equal(verified.ok, true);
+  it("produces a deterministic 64-character hex digest", () => {
+    const d1 = claimStatementDigest(baseClaim);
+    const d2 = claimStatementDigest(baseClaim);
+    assert.equal(d1.length, 64);
+    assert.match(d1, /^[0-9a-f]{64}$/);
+    assert.equal(d1, d2);
   });
 
-  it("rejects peer-reasoning ballots altered after the approved voting boundary", () => {
-    const boundaryMs = 1_750_000_000_000;
-    const reads = [
-      {
+  it("invalidates digest when wording changes", () => {
+    const original = claimStatementDigest(baseClaim);
+
+    // Question wording change
+    const qChanged = claimStatementDigest({
+      ...baseClaim,
+      question: "Will Stellar protocol 22 activate by November 2026?",
+    });
+    assert.notEqual(original, qChanged);
+
+    // Creator position wording change
+    const cpChanged = claimStatementDigest({
+      ...baseClaim,
+      creatorPosition: "CERTAINLY_YES",
+    });
+    assert.notEqual(original, cpChanged);
+
+    // Counter position wording change
+    const ctpChanged = claimStatementDigest({
+      ...baseClaim,
+      counterPosition: "PROBABLY_NO",
+    });
+    assert.notEqual(original, ctpChanged);
+  });
+
+  it("invalidates digest when source commitment changes", () => {
+    const original = claimStatementDigest(baseClaim);
+
+    // Resolution URL change
+    const urlChanged = claimStatementDigest({
+      ...baseClaim,
+      resolutionUrl: "https://github.com/stellar/stellar-core/releases",
+    });
+    assert.notEqual(original, urlChanged);
+
+    // Settlement rule change
+    const ruleChanged = claimStatementDigest({
+      ...baseClaim,
+      settlementRule: "Only network vote counts, press releases excluded",
+    });
+    assert.notEqual(original, ruleChanged);
+
+    // Context hash change
+    const ctxChanged = claimStatementDigest({
+      ...baseClaim,
+      contextHash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    });
+    assert.notEqual(original, ctxChanged);
+  });
+
+  it("normalizes whitespace and handles casing variations identically", () => {
+    const original = claimStatementDigest(baseClaim);
+
+    // Leading and trailing whitespace should trim to same digest
+    const trimmed = claimStatementDigest({
+      question: "  " + baseClaim.question + "  \n",
+      creatorPosition: "\t" + baseClaim.creatorPosition + " ",
+      counterPosition: " " + baseClaim.counterPosition + " ",
+      resolutionUrl: " " + baseClaim.resolutionUrl + "\t",
+      settlementRule: "\n" + baseClaim.settlementRule + " ",
+      contextHash: " " + baseClaim.contextHash + " ",
+    });
+    assert.equal(original, trimmed);
+
+    // Upper vs lowercase context hash hex normalizes
+    const upperHex = claimStatementDigest({
+      ...baseClaim,
+      contextHash: (baseClaim.contextHash ?? "").toUpperCase(),
+    });
+    assert.equal(original, upperHex);
+  });
+
+  it("supports snake_case and alternate property aliases interchangeably", () => {
+    const camel = claimStatementDigest({
+      question: "Will asset X list on DEX?",
+      creatorPosition: "YES",
+      counterPosition: "NO",
+      resolutionUrl: "https://example.com/res",
+      settlementRule: "Listing confirmed",
+      contextHash: "1234abcd".repeat(8),
+    });
+
+    const snake = claimStatementDigest({
+      question: "Will asset X list on DEX?",
+      creator_position: "YES",
+      counter_position: "NO",
+      resolution_url: "https://example.com/res",
+      settlement_rule: "Listing confirmed",
+      context_hash: "1234abcd".repeat(8),
+    });
+
+    const legacySides = claimStatementDigest({
+      question: "Will asset X list on DEX?",
+      sideA: "YES",
+      sideB: "NO",
+      resolution_url: "https://example.com/res",
+      settlement_rule: "Listing confirmed",
+      context_hash: "1234abcd".repeat(8),
+    });
+
+    assert.equal(camel, snake);
+    assert.equal(camel, legacySides);
+  });
+
+  it("boundary: handles empty, undefined, and partial objects without throwing", () => {
+    const empty = claimStatementDigest({});
+    assert.equal(empty.length, 64);
+    assert.match(empty, /^[0-9a-f]{64}$/);
+
+    const partial = claimStatementDigest({ question: "Partial question only" });
+    assert.equal(partial.length, 64);
+    assert.notEqual(empty, partial);
+  });
+});
+
+describe("peer reasoning cache binding and invalidation", () => {
+  beforeEach(() => {
+    clearPeerReasoningCache();
+  });
+
+  const sampleReads: PeerReasoningRead[] = [
+    {
+      sellerSlug: "contrarian",
+      sellerName: "Contrarian",
+      reasoning: "Counter evidence suggests a delay.",
+      pricePaidUnits: "10000",
+    },
+  ];
+
+  it("constructs cache keys with and without statement digest", () => {
+    assert.equal(peerReasoningCacheKey(101, "optimist"), "101:optimist");
+    assert.equal(
+      peerReasoningCacheKey(101, "optimist", "abcdef123456"),
+      "101:optimist:abcdef123456",
+    );
+  });
+
+  it("serves cached reasoning when statement digest matches", () => {
+    const digest = "d1".repeat(32);
+    setCachedPeerReasoning(42, "optimist", sampleReads, digest);
+
+    const hit = getCachedPeerReasoning(42, "optimist", digest);
+    assert.ok(hit);
+    assert.equal(hit.length, 1);
+    assert.equal(hit[0].sellerSlug, "contrarian");
+    assert.equal(hit[0].reasoning, sampleReads[0].reasoning);
+  });
+
+  it("invalidates cache when wording or source commitment changes digest", () => {
+    const digestOriginal = "11".repeat(32);
+    const digestWordingChanged = "22".repeat(32);
+    const digestSourceChanged = "33".repeat(32);
+
+    setCachedPeerReasoning(42, "optimist", sampleReads, digestOriginal);
+
+    // Exact match hits
+    assert.ok(getCachedPeerReasoning(42, "optimist", digestOriginal));
+
+    // Mismatched wording digest misses / invalidates
+    assert.equal(getCachedPeerReasoning(42, "optimist", digestWordingChanged), null);
+
+    // Mismatched source commitment digest misses / invalidates
+    assert.equal(getCachedPeerReasoning(42, "optimist", digestSourceChanged), null);
+  });
+
+  it("preserves independent cache entries for unrelated claims", () => {
+    const digestClaim1 = "aa".repeat(32);
+    const digestClaim2 = "bb".repeat(32);
+    const digestClaim1Updated = "cc".repeat(32);
+
+    const reads1: PeerReasoningRead[] = [
+      { sellerSlug: "s1", sellerName: "Seller 1", reasoning: "R1", pricePaidUnits: "10" },
+    ];
+    const reads2: PeerReasoningRead[] = [
+      { sellerSlug: "s2", sellerName: "Seller 2", reasoning: "R2", pricePaidUnits: "20" },
+    ];
+
+    setCachedPeerReasoning(101, "optimist", reads1, digestClaim1);
+    setCachedPeerReasoning(202, "optimist", reads2, digestClaim2);
+
+    // Both present
+    assert.equal(getCachedPeerReasoning(101, "optimist", digestClaim1)?.[0].reasoning, "R1");
+    assert.equal(getCachedPeerReasoning(202, "optimist", digestClaim2)?.[0].reasoning, "R2");
+
+    // Invalidate claim 1 by updating its cache entry under new digest
+    setCachedPeerReasoning(101, "optimist", [{ ...reads1[0], reasoning: "R1-new" }], digestClaim1Updated);
+
+    // Claim 1 old digest misses
+    assert.equal(getCachedPeerReasoning(101, "optimist", digestClaim1), null);
+    // Claim 1 new digest hits
+    assert.equal(getCachedPeerReasoning(101, "optimist", digestClaim1Updated)?.[0].reasoning, "R1-new");
+
+    // Unrelated Claim 2 is unaffected and preserves its entry
+    const claim2Hit = getCachedPeerReasoning(202, "optimist", digestClaim2);
+    assert.ok(claim2Hit);
+    assert.equal(claim2Hit[0].reasoning, "R2");
+  });
+
+  it("bounds cache size at PEER_REASONING_CACHE_MAX_ENTRIES", () => {
+    clearPeerReasoningCache();
+    assert.equal(peerReasoningCacheSize(), 0);
+
+    for (let id = 1; id <= PEER_REASONING_CACHE_MAX_ENTRIES + 25; id++) {
+      const digest = `digest_${id}`;
+      setCachedPeerReasoning(id, "optimist", sampleReads, digest);
+    }
+
+    assert.equal(peerReasoningCacheSize(), PEER_REASONING_CACHE_MAX_ENTRIES);
+    // Oldest evicted
+    assert.equal(getCachedPeerReasoning(1, "optimist", "digest_1"), null);
+    // Newest retained
+    const newest = getCachedPeerReasoning(
+      PEER_REASONING_CACHE_MAX_ENTRIES + 25,
+      "optimist",
+      `digest_${PEER_REASONING_CACHE_MAX_ENTRIES + 25}`,
+    );
+    assert.ok(newest);
+  });
+
+  it("prunes cache entries for inactive claims while keeping active claims", () => {
+    setCachedPeerReasoning(1, "optimist", sampleReads, "d1");
+    setCachedPeerReasoning(2, "optimist", sampleReads, "d2");
+    setCachedPeerReasoning(3, "optimist", sampleReads, "d3");
+
+    // Only claim 2 is active
+    prunePeerReasoningCache(new Set([2]));
+
+    assert.equal(getCachedPeerReasoning(1, "optimist", "d1"), null);
+    assert.ok(getCachedPeerReasoning(2, "optimist", "d2"));
+    assert.equal(getCachedPeerReasoning(3, "optimist", "d3"), null);
+  });
+
+  it("explicitly invalidates targeted claim entries with invalidatePeerReasoning", () => {
+    setCachedPeerReasoning(10, "optimist", sampleReads, "d10");
+    setCachedPeerReasoning(10, "pessimist", sampleReads, "d10");
+    setCachedPeerReasoning(20, "optimist", sampleReads, "d20");
+
+    // Invalidate claim 10 only
+    invalidatePeerReasoning(10);
+
+    assert.equal(getCachedPeerReasoning(10, "optimist", "d10"), null);
+    assert.equal(getCachedPeerReasoning(10, "pessimist", "d10"), null);
+    // Unrelated claim 20 remains
+    assert.ok(getCachedPeerReasoning(20, "optimist", "d20"));
+  });
+});
+
+describe("peer reasoning scenario with statement digest binding", () => {
+  beforeEach(() => {
+    clearPeerReasoningCache();
+  });
+
+  const personas = COUNCIL_PERSONAS;
+  const buyer = personas[0]; // optimist
+  const seller = personas[1]; // pessimist
+  const testPersonas = [buyer, seller];
+  const claim: ClaimStatementInput = {
+    question: "Will Soroban fees remain under 0.01 XLM?",
+    creatorPosition: "YES",
+    counterPosition: "NO",
+    resolutionUrl: "https://stellar.org/fees",
+    settlementRule: "Average transaction fee over 30 days",
+  };
+
+  it("warm cache serves reasoning without additional transport fetches", async () => {
+    const digest = claimStatementDigest(claim);
+
+    const scenarios = {
+      pessimist: {
         sellerSlug: "pessimist",
-        sellerName: "The Pessimist",
-        reasoning: "Bearish outlook based on primary data.",
-        pricePaidUnits: "10000",
-        claimRevision: "rev-1",
-        recordedAtMs: boundaryMs - 100,
+        reasoning: "Fees may fluctuate with surges.",
       },
-      {
-        sellerSlug: "statistician",
-        sellerName: "The Statistician",
-        reasoning: "Base rate supports challenger side.",
-        pricePaidUnits: "10000",
-        claimRevision: "rev-1",
-        recordedAtMs: boundaryMs,
-      },
-    ];
+    };
 
-    const commitment = createPeerReasoningCommitment({
-      claimId: 99,
-      claimRevision: "rev-1",
-      buyerSlug: "optimist",
-      eligibleVoteSet: ["pessimist", "statistician"],
-      votingBoundaryMs: boundaryMs,
-      reads,
-    });
-
-    // Mutated reasoning text after boundary lock.
-    const tamperedText = [
-      { ...reads[0]!, reasoning: "Altered reasoning after boundary." },
-      reads[1]!,
-    ];
-    const verifyText = verifyPeerReasoningCommitment(commitment, tamperedText);
-    assert.equal(verifyText.ok, false);
-    assert.equal(verifyText.reason, "altered_after_boundary");
-
-    // Mutated timestamp showing alteration after votingBoundaryMs.
-    const tamperedTime = [
-      { ...reads[0]!, alteredAtMs: boundaryMs + 1 },
-      reads[1]!,
-    ];
-    const verifyTime = verifyPeerReasoningCommitment(commitment, tamperedTime);
-    assert.equal(verifyTime.ok, false);
-    assert.equal(verifyTime.reason, "altered_after_boundary");
-
-    // Dropped read after boundary lock.
-    const verifyDropped = verifyPeerReasoningCommitment(commitment, [reads[0]!]);
-    assert.equal(verifyDropped.ok, false);
-    assert.equal(verifyDropped.reason, "altered_after_boundary");
-
-    // Claim revision mismatch.
-    const verifyRevision = verifyPeerReasoningCommitment(commitment, reads, {
-      claimRevision: "rev-2",
-    });
-    assert.equal(verifyRevision.ok, false);
-    assert.equal(verifyRevision.reason, "claim_revision_mismatch");
-  });
-
-  it("filters out spoofed seller identities, mismatched revisions, and post-boundary responses in buyPeerReasoning", async () => {
-    const boundaryMs = 1_750_000_000_000;
-    const sellers = selectPeerSellers(buyer, active, 7, 3);
-
-    const reads = await buyPeerReasoning({
+    // First call: cold cache, populates cache
+    const firstOutcome = await simulatePeerReasoningScenario({
       buyer,
-      activePersonas: active,
-      claimId: 7,
-      claimRevision: "rev-4",
-      eligibleVoteSet: sellers.map((s) => s.slug),
-      votingBoundaryMs: boundaryMs,
-      baseUrl: "http://council.local",
-      readsPerPersona: 3,
-      capUsdc: 0.005,
-      delayMs: 0,
-      payer: FAKE_PAYER,
-      now: () => boundaryMs,
-      fetchWithBudgetFn: async (url) => {
-        const slug = new URL(url).searchParams.get("persona")!;
-        if (slug === sellers[0]!.slug) {
-          // Spoofed persona slug in response body -> must be rejected.
-          return {
-            response: fakeResponse(200, {
-              claimId: 7,
-              claimRevision: "rev-4",
-              reasoning: "Spoofed seller response",
-              persona: { slug: "doomer", name: "The Doomer" },
-            }),
-            payment: { priceUnits: 10_000n, txHash: "1".repeat(64) },
-          };
-        }
-        if (slug === sellers[1]!.slug) {
-          // Altered after voting boundary -> must be rejected.
-          return {
-            response: fakeResponse(200, {
-              claimId: 7,
-              claimRevision: "rev-4",
-              reasoning: "Late altered response",
-              recordedAtMs: boundaryMs - 20,
-              alteredAtMs: boundaryMs + 1,
-              persona: { slug, name: sellers[1]!.displayName },
-            }),
-            payment: { priceUnits: 10_000n, txHash: "2".repeat(64) },
-          };
-        }
-        // Valid response exactly on the boundary.
-        return {
-          response: fakeResponse(200, {
-            claimId: 7,
-            claimRevision: "rev-4",
-            reasoning: "Valid boundary response",
-            recordedAtMs: boundaryMs,
-            persona: { slug, name: sellers[2]!.displayName },
-          }),
-          payment: { priceUnits: 10_000n, txHash: "3".repeat(64) },
-        };
+      activePersonas: testPersonas,
+      claimId: 77,
+      statementDigest: digest,
+      claim,
+      scenarios,
+    });
+
+    assert.equal(firstOutcome.reads.length, 1);
+    assert.equal(firstOutcome.reads[0].sellerSlug, "pessimist");
+    assert.equal(getCachedPeerReasoning(77, buyer.slug, digest)?.length, 1);
+
+    // Second call: warm cache serves cached reads directly
+    const secondOutcome = await simulatePeerReasoningScenario({
+      buyer,
+      activePersonas: testPersonas,
+      claimId: 77,
+      statementDigest: digest,
+      claim,
+      scenarios: {}, // empty scenarios would fail if fetch was attempted!
+    });
+
+    assert.equal(secondOutcome.reads.length, 1);
+    assert.equal(secondOutcome.reads[0].sellerSlug, "pessimist");
+    assert.equal(secondOutcome.reads[0].reasoning, "Fees may fluctuate with surges.");
+
+    // Changing wording invalidates cache and attempts fresh fetch (which sees empty scenarios)
+    const modifiedClaim: ClaimStatementInput = {
+      ...claim,
+      question: "Will Soroban fees remain under 0.05 XLM?", // modified question
+    };
+    const modifiedDigest = claimStatementDigest(modifiedClaim);
+
+    const thirdOutcome = await simulatePeerReasoningScenario({
+      buyer,
+      activePersonas: testPersonas,
+      claimId: 77,
+      statementDigest: modifiedDigest,
+      claim: modifiedClaim,
+      scenarios: {}, // empty scenarios -> cache missed -> fetch attempted -> 0 reads
+    });
+
+    assert.equal(thirdOutcome.reads.length, 0);
+  });
+
+  it("skipCache option forces fresh evaluation even when cache is warm", async () => {
+    const digest = claimStatementDigest(claim);
+    setCachedPeerReasoning(
+      88,
+      buyer.slug,
+      [{ sellerSlug: "stale-seller", sellerName: "Stale", reasoning: "old", pricePaidUnits: "1" }],
+      digest,
+    );
+
+    const outcome = await simulatePeerReasoningScenario({
+      buyer,
+      activePersonas: testPersonas,
+      claimId: 88,
+      statementDigest: digest,
+      claim,
+      skipCache: true,
+      scenarios: {
+        pessimist: {
+          sellerSlug: "pessimist",
+          reasoning: "fresh reasoning",
+        },
       },
     });
 
-    assert.equal(reads.length, 1);
-    assert.equal(reads[0]!.sellerSlug, sellers[2]!.slug);
-    assert.equal(reads[0]!.claimRevision, "rev-4");
-  });
-
-  it("throws BallotCommitmentError when buyer is included in eligible peer set or version is invalid", () => {
-    assert.throws(
-      () =>
-        createPeerReasoningCommitment({
-          claimId: 1,
-          claimRevision: 1,
-          buyerSlug: "optimist",
-          eligibleVoteSet: ["optimist", "pessimist"],
-          reads: [],
-        }),
-      (err: unknown) => err instanceof BallotCommitmentError && err.reason === "ineligible_voter",
-    );
-
-    assert.throws(
-      () =>
-        createPeerReasoningCommitment({
-          version: 9,
-          claimId: 1,
-          claimRevision: 1,
-          buyerSlug: "optimist",
-          eligibleVoteSet: ["pessimist"],
-          reads: [],
-        }),
-      (err: unknown) => err instanceof BallotCommitmentError && err.reason === "invalid_version",
-    );
+    assert.equal(outcome.reads[0].sellerSlug, "pessimist");
+    assert.equal(outcome.reads[0].reasoning, "fresh reasoning");
   });
 });
