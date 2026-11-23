@@ -5,11 +5,9 @@
 # the live route dependencies (lib/ops/public-api-openapi.ts) and verified
 # against lib/ops/json-schema-subset.ts in tests/node/public-api-openapi.test.ts.
 #
-# Conditional requests: settled-market read views return an ETag bound to the
-# canonical settlement identity and visibility of the market. Private
-# invite-scoped responses carry `Cache-Control: private` and a `Vary` on the
-# invite credential so they never share a public cache key. Clients may send
-# `If-None-Match`; a matching ETag yields `304 Not Modified` with no body.
+# Observation freshness: indexed market reads expose a shared `observation`
+# block (trusted ledger, observation time, known gaps) with identical meaning
+# across feed, detail, and performance endpoints.
 
 openapi: "3.1.0"
 info:
@@ -117,8 +115,11 @@ paths:
                   - items
                   - count
                   - cache
+                  - observation
                 additionalProperties: false
                 properties:
+                  observation:
+                    $ref: "#/components/schemas/ObservationFreshness"
                   items:
                     type: array
                     items:
