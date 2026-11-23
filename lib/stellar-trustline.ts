@@ -290,8 +290,9 @@ export interface EnsureUsdcTrustlineOptions {
  * that gains anything here). Idempotent from the caller's point of view: a
  * trustline that already exists returns immediately without prompting.
  *
- * Diagnostics identify the target asset and safe issuer metadata, keep private
- * connector payloads out of error messages, and redact secret seeds.
+ * When intent generation options or active address accessors are provided,
+ * late signatures from obsolete intents or switched accounts are ignored and
+ * rejected with `ObsoleteSigningIntentError`, preventing stale submissions to Horizon.
  */
 export interface HorizonTrustlineServer {
   loadAccount: (address: string) => Promise<Horizon.AccountResponse>;
@@ -362,6 +363,23 @@ export async function ensureUsdcTrustline(
     networkPassphrase: NETWORK_PASSPHRASE,
     address: signer.publicKey,
   });
+
+  // Verify that the signing intent is still active before submitting to Horizon.
+  // Drops late wallet responses belonging to an obsolete generation or switched account.
+  const activeGen = options.getActiveIntentGeneration?.();
+  const activeAddr = options.getActiveAddress?.();
+
+  if (
+    (options.intentGeneration !== undefined && activeGen !== undefined && activeGen !== options.intentGeneration) ||
+    (options.getActiveAddress && activeAddr !== signer.publicKey)
+  ) {
+    throw new ObsoleteSigningIntentError({
+      generation: options.intentGeneration ?? 0,
+      activeGeneration: activeGen ?? (options.intentGeneration ?? 0),
+      expectedAddress: signer.publicKey,
+      currentAddress: activeAddr ?? null,
+    });
+  }
 
   const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
   const hash = signed.hash().toString("hex");

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 
@@ -45,6 +45,11 @@ export function useUsdcTrustline(): UsdcTrustline {
   const [loading, setLoading] = useState(Boolean(address));
   const [adding, setAdding] = useState(false);
   const [tick, setTick] = useState(0);
+
+  const addressRef = useRef(address);
+  addressRef.current = address;
+  const generationRef = useRef(intentGeneration);
+  generationRef.current = intentGeneration;
 
   useEffect(() => {
     if (!address) {
@@ -91,16 +96,36 @@ export function useUsdcTrustline(): UsdcTrustline {
 
   const add = useCallback(async () => {
     if (!signer) return false;
+    const boundAddress = signer.publicKey;
+    const boundGeneration = generationRef.current;
     setAdding(true);
     setLoading(true);
     try {
-      await ensureUsdcTrustline(signer);
-      const next = await readUsdcTrustline(signer.publicKey, { sessionRevision });
+      await ensureUsdcTrustline(signer, {
+        intentGeneration: boundGeneration,
+        getActiveIntentGeneration: () => generationRef.current,
+        getActiveAddress: () => addressRef.current,
+      });
+
+      // Prevent an account switch from applying a stale result to the new wallet
+      if (addressRef.current !== boundAddress) {
+        return false;
+      }
+
+      const next = await readUsdcTrustline(signer.publicKey);
+      if (addressRef.current !== boundAddress) {
+        return false;
+      }
+
       setState(next);
       setCheckedAddress(signer.publicKey);
       setCheckedRevision(sessionRevision);
       return next.status === "ready";
     } catch (err) {
+      if (isObsoleteSigningIntentError(err)) {
+        // Obsolete signing intent / account switch: ignore late result silently
+        return false;
+      }
       const message = err instanceof Error ? err.message : String(err);
       toast.error(
         /reject|denied|cancel/i.test(message)

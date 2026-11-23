@@ -179,9 +179,8 @@ async function loadKit(): Promise<Kit> {
 export function sanitizeWalletMessage(message: string): string {
   if (!message) return "";
   return message
-    .replace(/(api[_-]?key|authorization|bearer|private[_-]?key|secret(?:[_-]?seed)?)\s*[:=]\s*S[A-Za-z2-7]{55}/gi, "$1=[redacted-seed]")
     .replace(/(api[_-]?key|authorization|bearer|private[_-]?key)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .replace(/(^|[^A-Za-z0-9])S[A-Za-z2-7]{55}(?![A-Za-z0-9])/gi, "$1[redacted-seed]");
+    .replace(/(^|[^A-Z0-9])S[A-Z2-7]{55}(?![A-Z0-9])/g, "$1[redacted-seed]");
 }
 
 /**
@@ -226,36 +225,115 @@ function isRejection(message: string): boolean {
   return /reject|denied|cancel|closed the modal|user declined/i.test(message);
 }
 
-// ── Session Revision Helpers ────────────────────────────────────────────────
+// ── Intent Generation and Obsolete Result Guarding ───────────────────────────
 
 /**
- * Exact case-sensitive account identity check.
- * Stellar strkeys are case-sensitive base32 strings; identity comparisons
- * must never lowercase or normalize character case.
+ * Thrown when an asynchronous wallet signing result arrives after the active
+ * signing intent has been superseded or the active wallet account has changed.
  */
-export function isSameAccountIdentity(
-  a: string | null | undefined,
-  b: string | null | undefined,
-): boolean {
-  if (a === null || a === undefined || b === null || b === undefined) {
-    return a === b;
+export class ObsoleteSigningIntentError extends Error {
+  readonly generation: number;
+  readonly activeGeneration: number;
+  readonly expectedAddress: string;
+  readonly currentAddress: string | null;
+
+  constructor(details: {
+    generation: number;
+    activeGeneration: number;
+    expectedAddress: string;
+    currentAddress: string | null;
+    message?: string;
+  }) {
+    super(
+      details.message ??
+        `Wallet signing result ignored: signing intent generation ${details.generation} is obsolete (active generation is ${details.activeGeneration}${
+          details.expectedAddress !== details.currentAddress
+            ? `, account switched from ${details.expectedAddress} to ${details.currentAddress ?? "disconnected"}`
+            : ""
+        }).`,
+    );
+    this.name = "ObsoleteSigningIntentError";
+    this.generation = details.generation;
+    this.activeGeneration = details.activeGeneration;
+    this.expectedAddress = details.expectedAddress;
+    this.currentAddress = details.currentAddress;
   }
-  return a === b;
+}
+
+/** Check if an unknown error represents an obsolete signing intent. */
+export function isObsoleteSigningIntentError(
+  error: unknown,
+): error is ObsoleteSigningIntentError {
+  return (
+    error instanceof ObsoleteSigningIntentError ||
+    (error instanceof Error &&
+      (error.name === "ObsoleteSigningIntentError" ||
+        /obsolete.*intent|stale.*intent|intent.*obsolete/i.test(error.message)))
+  );
+}
+
+export interface SigningIntent {
+  generation: number;
+  address: string;
 }
 
 /**
- * Returns true if an account, network, or connector transition should
- * increment the nonsecret session revision.
+ * Returns true if the given intent matches the active session generation and address.
  */
-export function shouldIncrementSessionRevision(
-  current: { address: string | null; walletId: string | null; network: string | null },
-  next: { address: string | null; walletId: string | null; network: string | null },
+export function isIntentActive(
+  intent: SigningIntent,
+  active: { generation: number; address: string | null },
 ): boolean {
-  return (
-    !isSameAccountIdentity(current.address, next.address) ||
-    current.walletId !== next.walletId ||
-    (current.network !== null && next.network !== null && current.network !== next.network)
-  );
+  return intent.generation === active.generation && intent.address === active.address;
+}
+
+/**
+ * Asserts that the intent matches the active session generation and address.
+ * Throws ObsoleteSigningIntentError if mismatched or obsolete.
+ */
+export function assertActiveIntent(
+  intent: SigningIntent,
+  active: { generation: number; address: string | null },
+): void {
+  if (!isIntentActive(intent, active)) {
+    throw new ObsoleteSigningIntentError({
+      generation: intent.generation,
+      activeGeneration: active.generation,
+      expectedAddress: intent.address,
+      currentAddress: active.address,
+    });
+  }
+}
+
+/**
+ * Bind an existing StellarSigner to an active intent generation.
+ * Any signing call that completes after the active generation or address has changed
+ * will reject with ObsoleteSigningIntentError instead of returning a stale signature.
+ */
+export function bindIntentToSigner(
+  signer: StellarSigner,
+  intent: SigningIntent,
+  getActive: () => { generation: number; address: string | null },
+): StellarSigner {
+  return {
+    publicKey: signer.publicKey,
+    signTransaction: async (xdr, opts) => {
+      assertActiveIntent(intent, getActive());
+      const result = await signer.signTransaction(xdr, opts);
+      assertActiveIntent(intent, getActive());
+      return result;
+    },
+    ...(signer.signAuthEntry
+      ? {
+          signAuthEntry: async (entry, opts) => {
+            assertActiveIntent(intent, getActive());
+            const result = await signer.signAuthEntry!(entry, opts);
+            assertActiveIntent(intent, getActive());
+            return result;
+          },
+        }
+      : {}),
+  };
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -313,31 +391,11 @@ export interface WalletContextValue {
   transactionState: TransactionState | null;
 
   /**
-   * Active uncertain-submission recovery state when a signed transaction was
-   * submitted but its on-chain outcome is unknown. Exposes the transaction
-   * hash and `canResubmit: false` so UI never prompts users to resubmit a
-   * possibly successful payment.
+   * Monotonic generation counter for the active signing intent and account session.
+   * Increments on account switch, disconnect, or when a new signing intent begins,
+   * binding responses to the active intent generation and preventing stale wallet results.
    */
-  uncertainSubmission: UncertainSubmissionState | null;
-
-  /**
-   * Record an uncertain transaction submission by hash, entering the
-   * `"uncertain-submission"` lifecycle state and blocking resubmission.
-   */
-  recordUncertainSubmission: (
-    params: CreateUncertainSubmissionParams,
-  ) => UncertainSubmissionState;
-
-  /**
-   * Run one bounded reconciliation check for the active uncertain submission.
-   * Returns `null` when no uncertain submission is active.
-   */
-  reconcileUncertainSubmission: (
-    options?: ReconcileUncertainSubmissionOptions,
-  ) => Promise<UncertainSubmissionState | null>;
-
-  /** Clear the active uncertain-submission recovery state. */
-  clearUncertainSubmission: () => void;
+  intentGeneration: number;
 
   /** Rows for the picker modal, already ordered. */
   wallets: ModalWallet[];
@@ -441,10 +499,7 @@ const NO_WALLET = "Connect a Stellar wallet first.";
 
 const Ctx = createContext<WalletContextValue>({
   transactionState: null,
-  uncertainSubmission: null,
-  recordUncertainSubmission: (params) => createUncertainSubmission(params),
-  reconcileUncertainSubmission: async () => null,
-  clearUncertainSubmission: () => {},
+  intentGeneration: 0,
   address: null,
   isConnected: false,
   isConnecting: false,
@@ -753,13 +808,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [networkWarning, setNetworkWarning] = useState<string | null>(null);
-  // Exposed through the context for lifecycle feedback UI; nothing in the
-  // provider drives it yet, so it stays `null` until a write flow sets it.
+  // Exposed through the context for lifecycle feedback UI. Driven by active
+  // signing intents, account switches, and disconnect transitions.
   const [transactionState, setTransactionState] = useState<TransactionState | null>(null);
-  const [uncertainSubmission, setUncertainSubmission] =
-    useState<UncertainSubmissionState | null>(null);
-  const uncertainSubmissionRef = useRef<UncertainSubmissionState | null>(null);
-  uncertainSubmissionRef.current = uncertainSubmission;
+  const [intentGeneration, setIntentGeneration] = useState(0);
+  const intentGenerationRef = useRef(0);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerLoading, setPickerLoading] = useState(false);
   const [options, setOptions] = useState<ShapedWallet[]>([]);
@@ -834,23 +887,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
         if (cancelled || !restored) return;
 
-        const prevAddress = addressRef.current;
-        const prevWalletId = walletIdRef.current;
-        const newWalletId = kit.selectedModule.productId;
-
         addressRef.current = restored;
-        walletIdRef.current = newWalletId;
-
-        if (
-          shouldIncrementSessionRevision(
-            { address: prevAddress, walletId: prevWalletId, network: networkRef.current },
-            { address: restored, walletId: newWalletId, network: networkRef.current },
-          )
-        ) {
-          sessionRevisionRef.current += 1;
-          setSessionRevision(sessionRevisionRef.current);
-        }
-
+        intentGenerationRef.current += 1;
+        setIntentGeneration(intentGenerationRef.current);
         setAddress(restored);
         setWalletId(newWalletId);
         setWalletName(kit.selectedModule.productName);
@@ -976,8 +1015,13 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         );
       }
 
+      const myGeneration = ++intentGenerationRef.current;
+      setIntentGeneration(myGeneration);
+      const startingAddress = addressRef.current;
+      setTransactionState("loading");
+
       const kit = await loadKit();
-      const signerAddress = opts?.address ?? addressRef.current ?? undefined;
+      const signerAddress = opts?.address ?? startingAddress ?? undefined;
 
       try {
         const signed = await kit.signTransaction(xdr, {
@@ -986,11 +1030,36 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           ...(signerAddress ? { address: signerAddress } : {}),
         });
 
+        // Ignore late results belonging to an obsolete signing intent or
+        // a superseded wallet connection.
+        if (
+          myGeneration !== intentGenerationRef.current ||
+          !addressRef.current ||
+          addressRef.current !== startingAddress
+        ) {
+          if (!addressRef.current) {
+            setTransactionState("disconnected");
+          } else {
+            setTransactionState("stale");
+          }
+          throw new ObsoleteSigningIntentError({
+            generation: myGeneration,
+            activeGeneration: intentGenerationRef.current,
+            expectedAddress: startingAddress,
+            currentAddress: addressRef.current,
+          });
+        }
+
+        setTransactionState(null);
         return {
           signedTxXdr: signed.signedTxXdr,
           signerAddress: signed.signerAddress,
         };
       } catch (cause) {
+        if (isObsoleteSigningIntentError(cause)) {
+          throw cause;
+        }
+
         const err = toWalletError(cause, "sign this transaction");
 
         if (/network|passphrase/i.test(err.message)) {
@@ -1188,22 +1257,13 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         // should be asked, because this is the click that asked for it.
         const { address: connected } = await kit.fetchAddress();
 
-        const prevAddress = addressRef.current;
-        const prevWalletId = walletIdRef.current;
-        const newWalletId = kit.selectedModule.productId;
-
+        // Update the address ref immediately and bump the intent generation
+        // so any in-flight signatures belonging to a previous account session
+        // are recognized as obsolete and rejected.
         addressRef.current = connected;
-        walletIdRef.current = newWalletId;
-
-        if (
-          shouldIncrementSessionRevision(
-            { address: prevAddress, walletId: prevWalletId, network: networkRef.current },
-            { address: connected, walletId: newWalletId, network: networkRef.current },
-          )
-        ) {
-          sessionRevisionRef.current += 1;
-          setSessionRevision(sessionRevisionRef.current);
-        }
+        intentGenerationRef.current += 1;
+        setIntentGeneration(intentGenerationRef.current);
+        setTransactionState(null);
 
         setAddress(connected);
         setWalletId(newWalletId);
@@ -1236,13 +1296,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     // The signing callbacks read addressRef directly, so this prevents a stale
     // wallet address from being used during the disconnect transition.
     addressRef.current = null;
-    walletIdRef.current = null;
-    networkRef.current = null;
-
-    if (prevAddress !== null || prevWalletId !== null) {
-      sessionRevisionRef.current += 1;
-      setSessionRevision(sessionRevisionRef.current);
-    }
+    intentGenerationRef.current += 1;
+    setIntentGeneration(intentGenerationRef.current);
+    setTransactionState("disconnected");
 
     setAddress(null);
     setWalletId(null);
@@ -1369,10 +1425,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       canSignAuthEntries: supportsAuthEntrySigning(walletId),
       networkWarning,
       transactionState,
-      uncertainSubmission,
-      recordUncertainSubmission,
-      reconcileUncertainSubmission,
-      clearUncertainSubmission,
+      intentGeneration,
       wallets,
       pendingTrustlineIntent,
       requestTrustlineThen,
@@ -1397,10 +1450,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       walletId,
       networkWarning,
       transactionState,
-      uncertainSubmission,
-      recordUncertainSubmission,
-      reconcileUncertainSubmission,
-      clearUncertainSubmission,
+      intentGeneration,
       wallets,
       pendingTrustlineIntent,
       requestTrustlineThen,
