@@ -31,11 +31,57 @@ export const PROPOSAL_CANCEL_ACTION = "proposal.cancel" as const;
 
 const NONCE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
-export interface SignedWindowOptions {
-  now?: number;
-  expectedRevision?: unknown;
-  currentRevision?: number;
+/**
+ * Canonical digest input for a market draft that an owner approves. Approval
+ * is bound to these exact fields (wording, source commitment, stake, deadline);
+ * any later change to one of them must invalidate the approval.
+ */
+export interface MarketDraftCommitment {
+  wording: string;
+  sourceCommitment: string;
+  stake: number;
+  deadline: number;
 }
+
+/**
+ * Deterministic JSON serialisation of the approved draft fields with sorted
+ * keys, so equivalent drafts always produce the same canonical string.
+ */
+export function canonicalMarketDraft(draft: MarketDraftCommitment): string {
+  return JSON.stringify({
+    deadline: draft.deadline,
+    sourceCommitment: draft.sourceCommitment,
+    stake: draft.stake,
+    wording: draft.wording,
+  });
+}
+
+/** Non-cryptographic FNV-1a digest hex of the canonical draft, for binding checks. */
+export function marketDraftDigest(draft: MarketDraftCommitment): string {
+  const input = canonicalMarketDraft(draft);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Returns true only when the draft currently matches the digest that was
+ * approved. Any change to wording, source commitment, stake or deadline
+ * yields a different digest and must reject execution.
+ */
+export function isApprovedDraftCurrent(
+  draft: MarketDraftCommitment,
+  approvedDigest: string,
+): boolean {
+  return marketDraftDigest(draft) === approvedDigest;
+}
+
+export type SignedWindowResult =
+  | { ok: true; nonce: string; expiresAt: number }
+  | { ok: false; code: "invalid_request" | "request_expired"; message: string; field: "nonce" | "expiresAt" };
 
 export type RevisionValidationResult =
   | { ok: true; expectedRevision?: number }
