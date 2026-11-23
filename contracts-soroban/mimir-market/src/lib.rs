@@ -1,15 +1,16 @@
 #![no_std]
-//! Mimir market — oracle-settled prediction market on Soroban.
-//!
-//! Port of `contracts/MimirV2.sol`. Stakes are held in a USDC Stellar Asset
-//! Contract; fees are charged on PROFIT only, snapshotted per claim, and any
-//! policy change is timelocked under a hard constant cap. Oracle
-//! rotation is likewise timelocked so settlement authority cannot move silently.
-//!
-//! Deliberate deviations from the Solidity original are marked
-//! `DEVIATION FROM SOLIDITY` at the point they occur.
+/// Mimir market — oracle-settled prediction market on Soroban.
+///
+/// Port of `contracts/MimirV2.sol`. Stakes are held in a USDC Stellar Asset
+/// Contract; fees are charged on PROFIT only, snapshotted per claim, and any
+/// policy change is timelocked under a hard constant cap. Oracle
+/// rotation is likewise timelocked so settlement authority cannot move silently.
+///
+/// Deliberate deviations from the Solidity original are marked
+/// `DEVIATION FROM SOLIDITY` at the point they occur.
 
 mod admin;
+mod claim_history;
 mod claims;
 mod contract;
 mod escrow;
@@ -28,6 +29,8 @@ pub use types::*;
 #[cfg(test)]
 mod test_challenge_lock;
 #[cfg(test)]
+mod test_claim_history;
+#[cfg(test)]
 mod test_common;
 #[cfg(test)]
 mod test_decimals;
@@ -38,6 +41,8 @@ mod test_fee_rounding;
 #[cfg(test)]
 mod test_fees;
 #[cfg(test)]
+mod test_fee_recipient_transition;
+#[cfg(test)]
 mod test_lifecycle;
 #[cfg(test)]
 mod test_pagination;
@@ -46,16 +51,18 @@ mod test_settlement;
 #[cfg(test)]
 mod test_verdict;
 #[cfg(test)]
+mod test_preflight;
+#[cfg(test)]
 mod test_batch_read;
 #[cfg(test)]
 mod test_batch_get_claims;
 #[cfg(test)]
 mod test_rematch_status;
-#[config(test)]
+#[cfg(test)]
 mod test_budgets;
-#[config(test)]
+#[cfg(test)]
 mod test_oracle_timelock;
-#[config(test)]
+#[cfg(test)]
 mod test_creator_index;
 #[cfg(test)]
 mod test_settlement_verifier;

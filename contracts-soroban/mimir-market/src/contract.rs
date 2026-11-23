@@ -4,15 +4,17 @@
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 
 use crate::admin;
+use crate::claim_history;
 use crate::claims;
 use crate::escrow;
 use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimStatement, CreateParams, Error, FeePolicy,
-    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict, WinnerSide,
-    MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimHistoryPage, ClaimPreflight,
+    CreateParams, Error, FeePolicy,
+    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
+    WinnerSide, MAX_BATCH_SIZE,
 };
 
 #[contract]
@@ -238,66 +240,34 @@ impl MimirMarket {
             return Err(Error::NotInitialized);
         }
         let (ids, total) = storage::get_creator_claims(&env, &creator, offset, limit);
-        Ok((ids, u32::try_from(total).unwrap_or(u32::MAX)))
+        Ok((ids, total.min(u32::MAX as u64) as u32))
     }
 
-    /// Preview payout aggregate and completeness for a creator's claim history.
+    /// One bounded page of a claim's transition history (#781), oldest first.
     ///
-    /// Reads up to `limit` claim ids starting at `offset` (0-based) from the
-    /// creator index, loading each claim and aggregating gross, fee, net and liability.
+    /// Each transition carries its stable identity `(claim_id, seq)`; `seq`
+    /// starts at 1 and is never reused, so a reference stays valid as new
+    /// transitions are appended. Returns transitions with `seq > cursor`
+    /// (`cursor = 0` for the first page; then the previous `next_cursor`).
     ///
-    /// # Invariants
+    /// Bounded: at most `MAX_HISTORY_PAGE_SIZE` (50) entries per call;
+    /// `limit = 0` means that maximum and a larger `limit` is refused with
+    /// `Error::HistoryPageTooLarge` before any storage read. The read opens one
+    /// entry per returned transition plus the claim's history head and never
+    /// the challenger roster, so its cost is O(page), not O(challengers).
     ///
-    /// - **Explicit missing observations:** If the page is truncated (`limit < total`
-    ///   or `offset > 0`) or any claim cannot be loaded, `missing_observations`
-    ///   records the missing count explicitly and `is_complete` is `false`.
-    /// - **Never present incomplete aggregate as verified total liability:**
-    ///   `verified_total_liability` is `Some(amount)` ONLY when `is_complete` is `true`.
-    ///   When truncated or missing observations exist, `verified_total_liability` is `None`.
-    pub fn preview_creator_payouts(
+    /// Incomplete history is explicit: `next_cursor` is `Some` while later
+    /// transitions exist, `from_genesis == false` means transitions before
+    /// seq 1 were never recorded on chain (claim predates history tracking),
+    /// and `missing_seq` names an archived entry the page stopped at.
+    /// Unknown claim ids return `Error::ClaimNotFound`.
+    pub fn get_claim_history(
         env: Env,
-        creator: Address,
-        offset: u32,
+        claim_id: u64,
+        cursor: u32,
         limit: u32,
-    ) -> Result<PayoutPreview, Error> {
-        if !storage::is_initialized(&env) {
-            return Err(Error::NotInitialized);
-        }
-        let total_count = storage::creator_claim_count(&env, &creator);
-        let (ids, _) = storage::get_creator_claims(&env, &creator, offset, limit);
-        let is_truncated = (offset as u64) > 0
-            || (limit > 0 && (offset as u64 + ids.len() as u64) < total_count);
-
-        let mut claims: Vec<Option<Claim>> = Vec::new(&env);
-        for id in ids.iter() {
-            claims.push_back(storage::get_claim_opt(&env, id));
-        }
-
-        fees::aggregate_payout_preview(&env, &claims, total_count as u32, is_truncated)
-    }
-
-    /// Preview payout aggregate and completeness for an explicit batch of claim ids.
-    ///
-    /// Guards against over-sized batches with `Error::BatchTooLarge`.
-    /// Missing claims are marked as missing observations, setting `is_complete = false`
-    /// and leaving `verified_total_liability = None`.
-    pub fn preview_claims_batch(
-        env: Env,
-        ids: Vec<u64>,
-    ) -> Result<PayoutPreview, Error> {
-        if ids.len() > MAX_BATCH_SIZE {
-            return Err(Error::BatchTooLarge);
-        }
-        if !storage::is_initialized(&env) {
-            return Err(Error::NotInitialized);
-        }
-
-        let mut claims: Vec<Option<Claim>> = Vec::new(&env);
-        for id in ids.iter() {
-            claims.push_back(storage::get_claim_opt(&env, id));
-        }
-
-        fees::aggregate_payout_preview(&env, &claims, ids.len(), false)
+    ) -> Result<ClaimHistoryPage, Error> {
+        claim_history::get_page(&env, claim_id, cursor, limit)
     }
 
     /// The claim's verdict with its explicit encoding version.

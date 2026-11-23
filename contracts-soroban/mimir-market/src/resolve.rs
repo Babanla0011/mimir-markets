@@ -20,14 +20,14 @@
 
 use soroban_sdk::{Address, BytesN, Env, String, Vec};
 
+use crate::claim_history;
 use crate::escrow;
 use crate::events;
 use crate::fees;
 use crate::storage;
 use crate::types::{
-    Challenger, Claim, ClaimState, Error, PayoutQuote, ResolutionExpirationPolicy, Verdict,
-    WinnerSide, CHALLENGE_LOCK_SECONDS, MAX_CONFIDENCE, ORACLE_TIMELOCK_SECONDS,
-    RESOLUTION_EXPIRY_SECONDS, VERDICT_VERSION_V1,
+    Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason,
+    TransitionKind, Verdict, WinnerSide,
 };
 use crate::util;
 
@@ -136,7 +136,8 @@ pub fn resolve_claim_versioned(
     confidence: u32,
     evidence_hash: BytesN<32>,
 ) -> Result<(), Error> {
-    storage::oracle(env)?.require_auth();
+    let oracle = storage::oracle(env)?;
+    oracle.require_auth();
 
     // Decode first: an unknown version must never be written, and `None` is not
     // a settled verdict. Both refusals leave the claim untouched.
@@ -263,6 +264,16 @@ pub fn resolve_claim_versioned(
     .publish(env);
     
     storage::set_claim(env, claim_id, &claim);
+    claim_history::record(
+        env,
+        claim_id,
+        TransitionKind::Resolved,
+        ClaimState::Active,
+        ClaimState::Resolved,
+        Some(oracle),
+        0,
+        winner_side,
+    )?;
     // Persist the verdict with its explicit version tag. `claim.winner_side`
     // remains the compatibility mirror for callers that read the claim struct.
     storage::set_verdict(env, claim_id, verdict);
