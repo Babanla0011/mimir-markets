@@ -19,6 +19,8 @@ mod resolve;
 mod storage;
 mod types;
 mod util;
+/// Offline, chain-free check of a recorded settlement (#805).
+pub mod settlement_verifier;
 
 pub use contract::{MimirMarket, MimirMarketClient};
 pub use types::*;
@@ -49,5 +51,11 @@ mod test_batch_read;
 mod test_batch_get_claims;
 #[cfg(test)]
 mod test_rematch_status;
+#[config(test)]
+mod test_budgets;
+#[config(test)]
+mod test_oracle_timelock;
+#[config(test)]
+mod test_creator_index;
 #[cfg(test)]
-mod test_statement;
+mod test_settlement_verifier;
