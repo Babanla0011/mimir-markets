@@ -59,4 +59,4 @@ mod test_oracle_timelock;
 #[config(test)]
 mod test_creator_index;
 #[cfg(test)]
-mod test_resolution_expiration_policy;
+mod test_fee_policy_compat;

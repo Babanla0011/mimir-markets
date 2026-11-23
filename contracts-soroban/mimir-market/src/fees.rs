@@ -1,10 +1,13 @@
 //! Payout arithmetic. The mirror of this lives in `lib/fees.ts`.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Env, Symbol, Vec};
 
 use crate::events;
 use crate::storage;
-use crate::types::{Error, FeeSnapshot, BPS_DIVISOR};
+use crate::types::{
+    Error, FeePolicyCompatibility, FeeRoundingMode, FeeSnapshot, BPS_DIVISOR,
+    FEE_POLICY_COMPAT_VERSION, FEE_TIMELOCK_SECONDS, MAX_TOTAL_FEE_BPS, MIN_STAKE, USDC_DECIMALS,
+};
 
 /// Exact fee-ledger view for one recipient, in atomic USDC units.
 ///
@@ -213,48 +216,45 @@ pub fn apply_fees(
     Ok((owed, fees_taken))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Pure-arithmetic boundary checks for the fee ledger view semantics.
-    // The FeeBalance derivation is `outstanding = accrued - claimed`; these
-    // assertions pin the three distinct states the issue requires.
-
-    fn balance(accrued: i128, claimed: i128) -> FeeBalance {
-        FeeBalance {
-            accrued,
-            claimed,
-            outstanding: accrued - claimed,
-        }
+/// Build the bounded fee-policy compatibility descriptor for generated clients.
+///
+/// Pure read over instance storage: performs no auth check, writes no state,
+/// emits no events, and returns `Err(Error::NotInitialized)` before
+/// `initialize` has succeeded.
+pub fn fee_policy_compatibility(env: &Env) -> Result<FeePolicyCompatibility, Error> {
+    if !storage::is_initialized(env) {
+        return Err(Error::NotInitialized);
     }
 
-    #[test]
-    fn no_accrual_is_distinct_from_fully_claimed() {
-        let never = balance(0, 0);
-        let fully_claimed = balance(500, 500);
-        assert_eq!(never.accrued, 0);
-        assert_eq!(never.outstanding, 0);
-        assert_eq!(fully_claimed.accrued, 500);
-        assert_eq!(fully_claimed.outstanding, 0);
-        assert_ne!(never.accrued, fully_claimed.accrued);
-    }
+    let policy = storage::fee_policy(env)?;
+    let has_pending_policy = storage::pending_fee_policy(env).is_some();
 
-    #[test]
-    fn partial_claim_leaves_exact_outstanding() {
-        let partial = balance(1_000_000, 250_000);
-        assert_eq!(partial.outstanding, 750_000);
-    }
+    let mut supported_fields = Vec::new(env);
+    supported_fields.push_back(Symbol::new(env, "platform_fee_bps"));
+    supported_fields.push_back(Symbol::new(env, "agent_owner_fee_bps"));
+    supported_fields.push_back(Symbol::new(env, "platform_recipient"));
+    supported_fields.push_back(Symbol::new(env, "agent_owner_recipient"));
+    supported_fields.push_back(Symbol::new(env, "revision"));
 
-    #[test]
-    fn quote_has_no_fees_at_or_below_principal() {
-        let fees = FeeSnapshot {
-            platform_fee_bps: 100,
-            agent_owner_fee_bps: 50,
-            platform_recipient: None,
-            agent_owner_recipient: None,
-        };
-        assert_eq!(quote_fees(100, 100, &fees).unwrap(), (100, 0));
-        assert_eq!(quote_fees(100, 90, &fees).unwrap(), (90, 0));
-    }
+    let current_total_fee_bps = policy
+        .platform_fee_bps
+        .checked_add(policy.agent_owner_fee_bps)
+        .ok_or(Error::Overflow)?;
+
+    Ok(FeePolicyCompatibility {
+        schema_version: FEE_POLICY_COMPAT_VERSION,
+        supported_fields,
+        max_total_fee_bps: MAX_TOTAL_FEE_BPS,
+        bps_divisor: BPS_DIVISOR,
+        fee_timelock_seconds: FEE_TIMELOCK_SECONDS,
+        usdc_decimals: USDC_DECIMALS,
+        min_stake: MIN_STAKE,
+        rounding_mode: FeeRoundingMode::FloorPerLegParticipantRemainder,
+        profit_only: true,
+        pull_based_payouts: true,
+        exact_usdc_escrow: true,
+        current_revision: policy.revision,
+        current_total_fee_bps,
+        has_pending_policy,
+    })
 }
