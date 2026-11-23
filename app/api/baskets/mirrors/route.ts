@@ -40,21 +40,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(err.body, { status: err.status });
   }
 
-  if (rawClaimId) {
-    const claimId = Number.parseInt(rawClaimId, 10);
-    if (!Number.isFinite(claimId)) {
-      const err = apiError("invalid_request", "claimId must be a valid integer");
-      return NextResponse.json(err.body, { status: err.status });
-    }
-    const preview = await previewFollowerMirror({ subscriber, claimId }).catch(() => null);
-    return NextResponse.json(
-      { preview },
-      { headers: { "cache-control": "no-store" } },
-    );
-  }
-
-  const [mirrors, subscriptions] = await Promise.all([
-    pendingMirrorsFor(subscriber).catch(() => []),
+  const [queue, subscriptions] = await Promise.all([
+    pendingMirrorsFor(subscriber).catch(() => ({ pending: [], ineligible: [] })),
     listBasketSubscriptions(subscriber).catch(() => []),
   ]);
 
@@ -67,7 +54,7 @@ export async function GET(req: NextRequest) {
   }
 
   return NextResponse.json(
-    { mirrors, following: subscriptions },
+    { mirrors: queue.pending, ineligible: queue.ineligible, following: subscriptions },
     { headers: { "cache-control": "no-store" } },
   );
 }

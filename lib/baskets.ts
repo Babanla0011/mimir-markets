@@ -280,15 +280,6 @@ export interface BasketExposurePreview {
 }
 
 /**
- * A member's contribution to the basket NAV.
- */
-export interface NavMember {
-  agentId: string;
-  weightBps: number;
-  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
-  returns: number[];
-}
-/**
  * Build a NAV series from basket member performance.
  *
  * The series is indexed to 100 at the first point. Each subsequent point is the
