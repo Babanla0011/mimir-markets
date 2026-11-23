@@ -76,6 +76,7 @@ export interface SpendPermissionRecord {
   createdAt: number;
   revokedAt?: number;
   revokedReason?: string;
+  revision?: number;
 }
 
 export type PermissionRejection =
@@ -177,6 +178,17 @@ export function permissionKey(input: {
     input.allowanceAtomic.toString(), String(input.periodSeconds),
     String(input.startAt), String(input.endAt), input.salt,
   ].join("|"));
+}
+
+/**
+ * Canonical revision identifier for a delegated spend permission.
+ *
+ * Reflects the signed parameters, allowance, period, revision, and revocation state.
+ */
+export function spendPermissionRevision(permission: SpendPermissionRecord): string {
+  const rev = typeof permission.revision === "number" ? permission.revision : 0;
+  const status = permission.revokedAt ? `revoked:${permission.revokedAt}` : "active";
+  return sha256Hex(`${permission.permissionHash}|rev:${rev}|status:${status}|allowance:${permission.allowanceAtomic.toString()}`);
 }
 
 /**
@@ -332,6 +344,7 @@ export interface SpendPermissionGrant {
   extraData?: unknown;
   signature?: unknown;
   permission?: unknown;
+  revision?: unknown;
 }
 
 function asStellarAddress(value: unknown): string | null {
@@ -390,4 +403,36 @@ export function parseSpendPermissionGrant(args: {
   if (allowanceAtomic === null || allowanceAtomic <= 0n) return { ok: false, error: "allowance must be a positive atomic amount" };
   const periodSeconds = asSeconds(grant.period);
   if (!periodSeconds) return { ok: false, error: "period must be positive seconds" };
+  const startAt = asSeconds(grant.start);
+  const endAt = asSeconds(grant.end);
+  if (startAt === null || endAt === null) return { ok: false, error: "start and end must be unix seconds" };
+  if (endAt <= startAt) return { ok: false, error: "end must follow start" };
+  if (endAt * 1000 <= now) return { ok: false, error: "permission has already expired" };
+
+  // Base64 as SEP-43 returns it. The bytes are verified against `account` by
+  // `verifyAgentSignature`; this only rejects an obviously non-signature.
+  const signature = typeof grant.signature === "string" && /^[A-Za-z0-9+/]{16,}={0,2}$/.test(grant.signature.trim())
+    ? grant.signature.trim() : null;
+  if (!signature) return { ok: false, error: "owner signature is required" };
+
+  const salt = asBigInt(grant.salt)?.toString() ?? "0";
+  const extraData = typeof grant.extraData === "string" ? grant.extraData : "";
+  const expirationLedger = asSeconds(grant.expirationLedger) ?? undefined;
+  const parsedRevision = asBigInt(grant.revision);
+  const revision = parsedRevision !== null && parsedRevision >= 0n ? Number(parsedRevision) : undefined;
+
+  return {
+    ok: true,
+    record: {
+      permissionHash: permissionKey({ account, spender: grantSpender, token, allowanceAtomic, periodSeconds, startAt, endAt, salt }),
+      agentId, account, spender: grantSpender, token, allowanceAtomic, periodSeconds,
+      startAt, endAt, salt, extraData, signature,
+      ...(expirationLedger !== undefined ? { expirationLedger } : {}),
+      ...(revision !== undefined ? { revision } : {}),
+      // Stored verbatim: a re-verification has to hash the object the owner
+      // actually signed, not one we rebuilt from parsed parts.
+      permissionJson: JSON.stringify(grant.permission ?? grant),
+      createdAt: now,
+    },
+  };
 }
