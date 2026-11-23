@@ -14,11 +14,13 @@ import { createHash } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/api/policy";
 import { apiError } from "@/lib/api/errors";
+import { isDbConfigured } from "@/lib/db";
 import {
   isDbConfigured,
   claimProposalForReview,
   completeProposalReview,
   cancelProposal,
+  getProposalById,
   markProposalDependencyFailed,
   markStaleProposals,
   recordProposalReviewDecision,
@@ -30,11 +32,12 @@ import {
   type MarketProposalRow,
 } from "@/lib/db";
 import {
-  decisionForReviewStatus,
-  defaultReasonCodeForDecision,
-  isProposalReviewReasonCode,
-  type ProposalReviewReasonCode,
-} from "@/lib/proposal-review-history";
+  enrichProposalWithExpiry,
+  resolveProposalExpiry,
+  resolveProposalExpiryPolicyRevision,
+  toCanonicalUtc,
+  type ProposalExpiryResolution,
+} from "@/lib/signed-window";
 
 export const runtime = "nodejs";
 
@@ -92,8 +95,65 @@ function json(data: unknown, status = 200): NextResponse {
   return NextResponse.json(data, { status });
 }
 
-function errorResponse(message: string, status = 400): NextResponse {
-  return json({ error: { message } }, status);
+function errorResponse(
+  message: string,
+  status = 400,
+  extra: Record<string, unknown> = {},
+): NextResponse {
+  const { code, ...rest } = extra;
+  return json(
+    {
+      error: {
+        ...(typeof code === "string" ? { code } : {}),
+        message,
+      },
+      ...rest,
+    },
+    status,
+  );
+}
+
+function expiryEnvelope(expiry: ProposalExpiryResolution): Record<string, unknown> {
+  return {
+    expiryStatus: expiry.status,
+    exists: expiry.exists,
+    expired: expiry.expired,
+    isExpired: expiry.isExpired,
+    effectiveExpiresAt: expiry.effectiveExpiresAt,
+    effectiveExpiresAtUtc: expiry.effectiveExpiresAtUtc,
+    effectiveExpiry: expiry.effectiveExpiresAtUtc,
+    deadlineAtUtc: expiry.deadlineAtUtc,
+    reviewWindowExpiresAt: expiry.reviewWindowExpiresAt,
+    reviewWindowExpiresAtUtc: expiry.reviewWindowExpiresAtUtc,
+    expirySource: expiry.expirySource,
+    remainingMs: expiry.remainingMs,
+    policyRevision: expiry.policyRevision,
+    evaluatedAtUtc: expiry.evaluatedAtUtc,
+  };
+}
+
+function absentProposalResponse(proposalId: string, nowMs: number): NextResponse {
+  const expiry = resolveProposalExpiry(null, { now: nowMs });
+  return errorResponse("Proposal not found", 404, {
+    code: "proposal_not_found",
+    proposalId,
+    status: "absent",
+    ...expiryEnvelope(expiry),
+  });
+}
+
+function expiredProposalResponse(
+  proposalId: string,
+  proposal: Record<string, unknown>,
+  expiry: ProposalExpiryResolution,
+): NextResponse {
+  return errorResponse("Proposal has expired", 409, {
+    code: "proposal_expired",
+    proposalId,
+    status: "expired",
+    reviewStatus: proposal.review_status ?? null,
+    ...expiryEnvelope(expiry),
+  });
 }
 
 /**
@@ -172,6 +232,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     return errorResponse("Database not configured", 503);
   }
 
+  const { searchParams } = new URL(request.url);
+  const proposalIdRaw = searchParams.get("proposalId") ?? searchParams.get("proposal_id");
   const statusRaw = searchParams.get("status");
   const limitRaw = searchParams.get("limit");
   const offsetRaw = searchParams.get("offset");
@@ -199,11 +261,31 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
+    if (proposalIdRaw !== null && proposalIdRaw.trim() !== "") {
+      const proposalId = proposalIdRaw.trim();
+      const nowMs = Date.now();
+      const row = await getProposalById(proposalId);
+      if (!row) {
+        return absentProposalResponse(proposalId, nowMs);
+      }
+      const expiry = resolveProposalExpiry(row, { now: nowMs });
+      const enriched = enrichProposalWithExpiry(row, { now: nowMs });
+      return json({
+        proposal: enriched,
+        proposals: [enriched],
+        proposalId,
+        status: row.review_status ?? null,
+        ...expiryEnvelope(expiry),
+      });
+    }
+
     const result = await listProposalsForReview({ status, limit, offset });
     return json({
       proposals: result.proposals,
       limit: result.limit,
       offset: result.offset,
+      policyRevision: result.policyRevision,
+      evaluatedAtUtc: result.evaluatedAtUtc,
     });
   } catch (err) {
     console.error("[proposals/review] GET error:", err);
@@ -262,70 +344,71 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
+    const nowMs = Date.now();
     switch (action) {
       case "claim": {
         if (!proposalId || !reviewer) {
           return errorResponse("claim requires proposalId and reviewer", 400);
         }
-        const existing = await getProposal(proposalId);
-        if (existing && getProposalRevision(existing) > 0) {
-          const err = apiError("conflict", "proposal review revision is stale: review decision already recorded", {
-            field: "expectedRevision",
-          });
-          return NextResponse.json(err.body, { status: err.status, headers: err.headers });
+        const existing = await getProposalById(proposalId);
+        if (!existing) {
+          return absentProposalResponse(proposalId, nowMs);
+        }
+        const expiry = resolveProposalExpiry(existing, { now: nowMs });
+        if (expiry.expired) {
+          return expiredProposalResponse(proposalId, existing, expiry);
         }
         const ok = await claimProposalForReview(proposalId, reviewer);
         if (!ok) {
-          const refreshed = await getProposal(proposalId);
-          if (refreshed && getProposalRevision(refreshed) > 0) {
-            const err = apiError("conflict", "proposal review revision is stale: review decision already recorded", {
-              field: "expectedRevision",
-            });
-            return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-          }
-          return errorResponse("Proposal not available for claim (not queued or already claimed)", 409);
+          return errorResponse(
+            "Proposal not available for claim (not queued or already claimed)",
+            409,
+            {
+              code: "invalid_state_transition",
+              proposalId,
+              status: existing.review_status ?? null,
+              ...expiryEnvelope(expiry),
+            },
+          );
         }
-        return json({ success: true, proposalId, status: "in_review" });
+        return json({
+          success: true,
+          proposalId,
+          status: "in_review",
+          ...expiryEnvelope(expiry),
+        });
       }
 
       case "complete": {
         if (!proposalId || !reviewer || typeof approve !== "boolean") {
           return errorResponse("complete requires proposalId, reviewer, and approve (boolean)", 400);
         }
-        if (approve && (typeof approvedDigest !== "string" || !/^[0-9a-f]{64}$/.test(approvedDigest))) {
-          return errorResponse("approve requires approvedDigest (sha256 hex of the reviewed draft)", 400);
+        const existing = await getProposalById(proposalId);
+        if (!existing) {
+          return absentProposalResponse(proposalId, nowMs);
         }
-        const ok = await completeProposalReview(
-          proposalId,
-          reviewer,
-          approve,
-          approve ? approvedDigest : undefined,
-        );
+        const expiry = resolveProposalExpiry(existing, { now: nowMs });
+        if (expiry.expired) {
+          return expiredProposalResponse(proposalId, existing, expiry);
+        }
+        const ok = await completeProposalReview(proposalId, reviewer, approve);
         if (!ok) {
-          const refreshed = await getProposal(proposalId);
-          if (refreshed && getProposalRevision(refreshed) > 0) {
-            const err = apiError("conflict", "proposal review revision is stale: review decision already recorded", {
-              field: "expectedRevision",
-            });
-            return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-          }
-          return errorResponse("Proposal not in review by this reviewer", 409);
+          return errorResponse(
+            "Proposal not in review by this reviewer",
+            409,
+            {
+              code: "invalid_state_transition",
+              proposalId,
+              status: existing.review_status ?? null,
+              ...expiryEnvelope(expiry),
+            },
+          );
         }
-        const decision = approve ? "accepted" : "rejected";
-        const effectiveReasonCode = validatedReasonCode ?? defaultReasonCodeForDecision(decision);
-        await recordProposalReviewDecision({
-          proposalId,
-          decision,
-          reasonCode: effectiveReasonCode,
-          actorId: reviewer,
-          privateNote: privateNote ?? reason ?? null,
-        });
         return json({
           success: true,
           proposalId,
           status: approve ? "approved" : "rejected",
-          decision,
-          reasonCode: effectiveReasonCode,
+          ...expiryEnvelope(expiry),
         });
       }
 
@@ -339,82 +422,32 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         if (!targetId || !cancelReason) {
           return errorResponse("cancel requires proposalId and reason", 400);
         }
-        const ok = await cancelProposal(targetId, cancelReason);
-        if (!ok) {
-          return errorResponse("Proposal not cancellable (not queued or in_review)", 409);
+        const existing = await getProposalById(proposalId);
+        if (!existing) {
+          return absentProposalResponse(proposalId, nowMs);
         }
-        const decision = supersededByProposalId ? "superseded" : "rejected";
-        const effectiveReasonCode =
-          validatedReasonCode ??
-          (supersededByProposalId ? "SUPERSEDED_BY_NEWER_PROPOSAL" : "CANCELLED_BY_OPERATOR");
-        await recordProposalReviewDecision({
-          proposalId,
-          decision,
-          reasonCode: effectiveReasonCode,
-          supersededByProposalId: supersededByProposalId ?? null,
-          actorId: reviewer ?? null,
-          privateNote: privateNote ?? reason,
-        });
+        const expiry = resolveProposalExpiry(existing, { now: nowMs });
+        if (expiry.expired) {
+          return expiredProposalResponse(proposalId, existing, expiry);
+        }
+        const ok = await cancelProposal(proposalId, reason);
+        if (!ok) {
+          return errorResponse(
+            "Proposal not cancellable (not queued or in_review)",
+            409,
+            {
+              code: "invalid_state_transition",
+              proposalId,
+              status: existing.review_status ?? null,
+              ...expiryEnvelope(expiry),
+            },
+          );
+        }
         return json({
           success: true,
           proposalId,
           status: "cancelled",
-          decision,
-          reasonCode: effectiveReasonCode,
-        });
-      }
-
-      case "supersede": {
-        if (!proposalId || !supersededByProposalId) {
-          return errorResponse("supersede requires proposalId and supersededByProposalId", 400);
-        }
-        const ok = await cancelProposal(proposalId, reason ?? `superseded by ${supersededByProposalId}`);
-        if (!ok) {
-          return errorResponse("Proposal not superseding-eligible (not queued or in_review)", 409);
-        }
-        const effectiveReasonCode = validatedReasonCode ?? "SUPERSEDED_BY_NEWER_PROPOSAL";
-        await recordProposalReviewDecision({
-          proposalId,
-          decision: "superseded",
-          reasonCode: effectiveReasonCode,
-          supersededByProposalId,
-          actorId: reviewer ?? null,
-          privateNote: privateNote ?? reason ?? null,
-        });
-        return json({
-          success: true,
-          proposalId,
-          status: "cancelled",
-          decision: "superseded",
-          reasonCode: effectiveReasonCode,
-          supersededByProposalId,
-        });
-      }
-
-      case "expire": {
-        if (!proposalId) {
-          return errorResponse("expire requires proposalId", 400);
-        }
-        const effectiveReasonCode = validatedReasonCode ?? "REVIEW_DEADLINE_EXPIRED";
-        const ok = await updateProposalReviewStatus(proposalId, "stale", {
-          failureReason: reason ?? effectiveReasonCode,
-        });
-        if (!ok) {
-          return errorResponse("Proposal not found or could not be expired", 409);
-        }
-        await recordProposalReviewDecision({
-          proposalId,
-          decision: "expired",
-          reasonCode: effectiveReasonCode,
-          actorId: reviewer ?? null,
-          privateNote: privateNote ?? reason ?? null,
-        });
-        return json({
-          success: true,
-          proposalId,
-          status: "stale",
-          decision: "expired",
-          reasonCode: effectiveReasonCode,
+          ...expiryEnvelope(expiry),
         });
       }
 
@@ -422,31 +455,46 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         if (!proposalId || !reason) {
           return errorResponse("mark_dependency_failed requires proposalId and reason", 400);
         }
+        const existing = await getProposalById(proposalId);
+        if (!existing) {
+          return absentProposalResponse(proposalId, nowMs);
+        }
+        const expiry = resolveProposalExpiry(existing, { now: nowMs });
+        if (expiry.expired) {
+          return expiredProposalResponse(proposalId, existing, expiry);
+        }
         const ok = await markProposalDependencyFailed(proposalId, reason);
         if (!ok) {
-          return errorResponse("Proposal not in a state that can be marked as dependency_failed", 409);
+          return errorResponse(
+            "Proposal not in a state that can be marked as dependency_failed",
+            409,
+            {
+              code: "invalid_state_transition",
+              proposalId,
+              status: existing.review_status ?? null,
+              ...expiryEnvelope(expiry),
+            },
+          );
         }
-        const effectiveReasonCode = validatedReasonCode ?? "DEPENDENCY_FAILED";
-        await recordProposalReviewDecision({
-          proposalId,
-          decision: "rejected",
-          reasonCode: effectiveReasonCode,
-          actorId: reviewer ?? null,
-          privateNote: privateNote ?? reason,
-        });
         return json({
           success: true,
           proposalId,
           status: "dependency_failed",
-          decision: "rejected",
-          reasonCode: effectiveReasonCode,
+          ...expiryEnvelope(expiry),
         });
       }
 
       case "mark_stale": {
-        const nowSeconds = Math.floor(Date.now() / 1000);
+        const nowSeconds = Math.floor(nowMs / 1000);
         const count = await markStaleProposals(nowSeconds);
-        return json({ success: true, markedStale: count });
+        return json({
+          success: true,
+          markedStale: count,
+          policyRevision: resolveProposalExpiryPolicyRevision(
+            process.env.PROPOSAL_EXPIRY_POLICY_REVISION,
+          ),
+          evaluatedAtUtc: toCanonicalUtc(nowMs),
+        });
       }
 
       default:
@@ -500,36 +548,35 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
+    const nowMs = Date.now();
+    const existing = await getProposalById(proposalId);
+    if (!existing) {
+      return absentProposalResponse(proposalId, nowMs);
+    }
+    const expiry = resolveProposalExpiry(existing, { now: nowMs });
+    if (expiry.expired && status !== "stale") {
+      return expiredProposalResponse(proposalId, existing, expiry);
+    }
+
     const ok = await updateProposalReviewStatus(proposalId, status, { reviewer, failureReason });
     if (!ok) {
-      const refreshed = await getProposal(proposalId);
-      if (refreshed && getProposalRevision(refreshed) > 0) {
-        const err = apiError("conflict", "proposal review revision is stale: review decision already recorded", {
-          field: "expectedRevision",
-        });
-        return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-      }
-      return errorResponse("Proposal not found or invalid state transition", 409);
-    }
-    const decision = decisionForReviewStatus(status, { supersededByProposalId });
-    if (decision) {
-      const effectiveReasonCode =
-        validatedReasonCode ??
-        (status === "dependency_failed"
-          ? "DEPENDENCY_FAILED"
-          : status === "cancelled" && !supersededByProposalId
-            ? "CANCELLED_BY_OPERATOR"
-            : defaultReasonCodeForDecision(decision));
-      await recordProposalReviewDecision({
+      return errorResponse("Proposal not found or invalid state transition", 409, {
+        code: "invalid_state_transition",
         proposalId,
-        decision,
-        reasonCode: effectiveReasonCode,
-        supersededByProposalId: supersededByProposalId ?? null,
-        actorId: reviewer ?? null,
-        privateNote: privateNote ?? failureReason ?? null,
+        status: existing.review_status ?? null,
+        ...expiryEnvelope(expiry),
       });
     }
-    return json({ success: true, proposalId, status });
+    const updatedExpiry =
+      status === "stale"
+        ? resolveProposalExpiry({ ...existing, review_status: "stale" }, { now: nowMs })
+        : expiry;
+    return json({
+      success: true,
+      proposalId,
+      status,
+      ...expiryEnvelope(updatedExpiry),
+    });
   } catch (err) {
     console.error("[proposals/review] PATCH Error:", err);
     return internalErrorResponse(500);
