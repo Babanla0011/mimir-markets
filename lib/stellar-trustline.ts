@@ -64,66 +64,7 @@ import {
   type StellarSigner,
 } from "./stellar";
 import { USDC_CODE, USDC_ISSUER, usdcAsset } from "./usdc";
-import {
-  getBrowserWalletSigningCoordinator,
-  resolveUncoordinatedSignTransaction,
-  type WalletSigningCoordinator,
-} from "./wallet-signing-coordinator";
-
-/** Safe metadata identifying the USDC asset and issuer. */
-export const USDC_TRUSTLINE_DESCRIPTOR = {
-  code: USDC_CODE,
-  issuer: USDC_ISSUER,
-} as const;
-
-/**
- * Redact Stellar secret seeds (S… 56 base32 chars) and sensitive tokens
- * from diagnostic/error strings to avoid leaking credentials.
- * Preserves public keys (G…), contract IDs (C…), and asset identifiers.
- */
-export function sanitizeTrustlineDiagnostic(detail: string): string {
-  if (!detail) return "";
-  return detail
-    .replace(/(api[_-]?key|authorization|bearer|private[_-]?key|secret(?:[_-]?seed)?)\s*[:=]\s*S[A-Za-z2-7]{55}/gi, "$1=[redacted-seed]")
-    .replace(/(api[_-]?key|authorization|bearer|private[_-]?key)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .replace(/(^|[^A-Za-z0-9])S[A-Za-z2-7]{55}(?![A-Za-z0-9])/gi, "$1[redacted-seed]");
-}
-
-/**
- * Format a trustline operation error so that it clearly identifies the target asset
- * and safe issuer metadata, while keeping private connector payloads out of public
- * diagnostics and redacting any accidental secret seeds.
- */
-export function formatTrustlineError(cause: unknown): Error {
-  let rawMessage = "";
-  if (cause instanceof Error) {
-    rawMessage = cause.message;
-  } else if (cause && typeof cause === "object") {
-    // Only extract public error messages; private connector payloads
-    // (such as `ext`, `payload`, `data`) are strictly kept out of diagnostics.
-    const obj = cause as { message?: unknown; error?: unknown };
-    if (typeof obj.message === "string" && obj.message.trim()) {
-      rawMessage = obj.message.trim();
-    } else if (typeof obj.error === "string" && obj.error.trim()) {
-      rawMessage = obj.error.trim();
-    }
-  } else if (typeof cause === "string" && cause.trim()) {
-    rawMessage = cause.trim();
-  }
-
-  const sanitized = sanitizeTrustlineDiagnostic(rawMessage);
-
-  // If the message already contains both the asset code and safe issuer metadata,
-  // preserve it directly.
-  if (sanitized && sanitized.includes(USDC_CODE) && sanitized.includes(USDC_ISSUER)) {
-    return new Error(sanitized);
-  }
-
-  const detail = sanitized ? `: ${sanitized}` : ".";
-  return new Error(
-    `Failed to add ${USDC_CODE} trustline (issuer: ${USDC_ISSUER})${detail}`,
-  );
-}
+import { isUncertainSubmissionError } from "./wallet-submission-recovery";
 
 export type TrustlineStatus =
   /** Trustline present: the account can hold and stake USDC. */
@@ -352,14 +293,53 @@ export interface EnsureUsdcTrustlineOptions {
  * Diagnostics identify the target asset and safe issuer metadata, keep private
  * connector payloads out of error messages, and redact secret seeds.
  */
+export interface HorizonTrustlineServer {
+  loadAccount: (address: string) => Promise<Horizon.AccountResponse>;
+  submitTransaction: (
+    transaction: ReturnType<typeof TransactionBuilder.fromXDR>,
+  ) => Promise<{ hash: string }>;
+}
+
+export interface EnsureUsdcTrustlineOptions {
+  /** Optional Horizon server override for testing or custom transports. */
+  server?: HorizonTrustlineServer;
+  /** Optional trustline reader override for testing. */
+  readTrustline?: (address: string) => Promise<TrustlineState>;
+}
+
+/**
+ * Thrown when a signed USDC trustline transaction was submitted to Horizon,
+ * but a transport/timeout error left the on-chain outcome uncertain.
+ *
+ * Exposes the deterministic transaction `hash` and explicitly sets
+ * `canResubmit = false` so wallet flows reconcile instead of prompting the
+ * user to resubmit a possibly successful transaction.
+ */
+export class UncertainTrustlineSubmissionError extends Error {
+  readonly hash: string;
+  readonly status = "uncertain-submission" as const;
+  readonly canResubmit = false as const;
+
+  constructor(hash: string, cause?: unknown) {
+    super(
+      `USDC trustline transaction ${hash} may have already succeeded on Stellar. Do not resubmit; reconcile status first.`,
+      cause !== undefined ? { cause } : undefined,
+    );
+    this.name = "UncertainTrustlineSubmissionError";
+    this.hash = hash;
+  }
+}
+
 export async function ensureUsdcTrustline(
   signer: StellarSigner,
   options: EnsureUsdcTrustlineOptions = {},
 ): Promise<{ added: boolean; hash?: string }> {
-  const existing = await readUsdcTrustline(
-    signer.publicKey,
-    options.horizon ? { server: options.horizon } : {},
-  );
+  const existing = options.readTrustline
+    ? await options.readTrustline(signer.publicKey)
+    : await readUsdcTrustline(
+        signer.publicKey,
+        options.server ? { loadAccount: (addr) => options.server!.loadAccount(addr) } : {},
+      );
   if (existing.status === "ready") return { added: false };
   if (existing.status === "unfunded") {
     throw new Error(
@@ -367,100 +347,7 @@ export async function ensureUsdcTrustline(
     );
   }
 
-  const coordinator =
-    options.coordinator !== undefined
-      ? options.coordinator
-      : typeof window !== "undefined"
-        ? getBrowserWalletSigningCoordinator()
-        : null;
-
-  const execute = async (): Promise<{ added: boolean; hash?: string }> => {
-    const horizon = options.horizon ?? createHorizonServer();
-    const account = await horizon.loadAccount(signer.publicKey);
-
-    const transaction = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASE,
-    })
-      .addOperation(Operation.changeTrust({ asset: usdcAsset() }))
-      // 180s rather than the 30s used for simulation-only envelopes: this one is
-      // actually submitted, and a hardware wallet confirmation can take a while.
-      .setTimeout(180)
-      .build();
-
-    const signTx = resolveUncoordinatedSignTransaction(signer.signTransaction);
-    const { signedTxXdr } = await signTx(transaction.toXDR(), {
-      networkPassphrase: NETWORK_PASSPHRASE,
-      address: signer.publicKey,
-    });
-
-    const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
-    const result = await horizon.submitTransaction(signed);
-    return { added: true, hash: result.hash };
-  };
-
-  if (!coordinator) {
-    return execute();
-  }
-
-  return coordinator.runOperation(
-    {
-      account: signer.publicKey,
-      operationKind: "enable_trustline",
-      acknowledgeUncertainRecovery: options.acknowledgeUncertainRecovery,
-      expectedRecoveryOperationId: options.expectedRecoveryOperationId,
-    },
-    execute,
-  );
-}
-
-
-// ── Decoupled submit / confirm (#769) ────────────────────────────────────────
-//
-// `ensureUsdcTrustline` above awaits `horizon.submitTransaction` and returns
-// after the tx is already in a ledger. That is fine for a caller that stays
-// on the screen, but a *resumable* setup needs the two steps separate: the
-// classic trustline transaction must be submittable on its own, and the
-// caller must be able to leave and come back before we treat it as ready.
-//
-// The two functions below provide that split without changing
-// `ensureUsdcTrustline` — its behaviour and return shape are byte-identical.
-
-/** Terminal or in-flight state of a decoupled trustline submission. */
-export type TrustlineTransactionOutcome =
-  | { status: "submitted"; hash: string }
-  | { status: "confirmed"; hash: string }
-  | { status: "failed"; reason: string };
-
-/**
- * Build, sign and submit the classic USDC changeTrust — and stop there.
- *
- * The returned `hash` identifies the submission so the caller can persist
- * `pendingTrustlineIntent` and await confirmation later. No polling, no
- * confirmation wait: the caller decides when to call
- * {@link awaitUsdcTrustlineConfirmation}.
- *
- * An account that already holds the trustline is a no-op that returns the
- * "submitted" state with a synthetic hash so callers have one shape to
- * handle. The intent behind this (#769) is idempotency, not a real ledger
- * write, so no signature is prompted.
- */
-export async function submitUsdcTrustline(
-  signer: StellarSigner,
-): Promise<TrustlineTransactionOutcome> {
-  const existing = await readUsdcTrustline(signer.publicKey);
-  if (existing.status === "ready") {
-    return { status: "submitted", hash: "" };
-  }
-  if (existing.status === "unfunded") {
-    return {
-      status: "failed",
-      reason:
-        "This account does not exist on the Stellar ledger yet. Fund it with XLM first, then add the USDC trustline.",
-    };
-  }
-
-  const horizon = createHorizonServer();
+  const horizon = options.server ?? createHorizonServer();
   const account = await horizon.loadAccount(signer.publicKey);
 
   const transaction = new TransactionBuilder(account, {
@@ -477,18 +364,18 @@ export async function submitUsdcTrustline(
   });
 
   const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+  const hash = signed.hash().toString("hex");
   try {
     const result = await horizon.submitTransaction(signed);
-    return { status: "submitted", hash: result.hash };
+    return { added: true, hash: result.hash || hash };
   } catch (cause) {
-    return {
-      status: "failed",
-      reason:
-        cause instanceof Error
-          ? cause.message
-          : "Trustline submission failed.",
-    };
+    if (isUncertainSubmissionError(cause)) {
+      throw new UncertainTrustlineSubmissionError(hash, cause);
+    }
+    throw cause;
   }
+
+
 }
 
 /**

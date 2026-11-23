@@ -60,27 +60,25 @@ import {
 } from "./wallet-connectors";
 import { walletRowLabel } from "./wallet-aria";
 import {
-  getBrowserWalletSigningCoordinator,
-  registerUncoordinatedSignTransaction,
-  type WalletSigningAccountState,
-  type WalletSigningOperationKind,
-  type WalletSigningOperationRecord,
-} from "./wallet-signing-coordinator";
+  canResubmitPayment,
+  createUncertainSubmission,
+  reconcileUncertainSubmission as reconcileUncertainSubmissionState,
+  type CreateUncertainSubmissionParams,
+  type ReconcileUncertainSubmissionOptions,
+  type ReconciliationProbeResult,
+  type UncertainSubmissionState,
+  type UncertainSubmissionStatus,
+} from "./wallet-submission-recovery";
 
-export type WalletSigningOperationMessageKey =
-  | "signingOperationSignTransaction"
-  | "signingOperationSignAuthEntry"
-  | "signingOperationSignMessage"
-  | "signingOperationEnableTrustline";
-
-export const WALLET_SIGNING_OPERATION_MESSAGE_KEYS: Record<
-  WalletSigningOperationKind,
-  WalletSigningOperationMessageKey
-> = {
-  sign_transaction: "signingOperationSignTransaction",
-  sign_auth_entry: "signingOperationSignAuthEntry",
-  sign_message: "signingOperationSignMessage",
-  enable_trustline: "signingOperationEnableTrustline",
+export {
+  canResubmitPayment,
+  createUncertainSubmission,
+  reconcileUncertainSubmissionState as reconcileUncertainSubmission,
+  type CreateUncertainSubmissionParams,
+  type ReconcileUncertainSubmissionOptions,
+  type ReconciliationProbeResult,
+  type UncertainSubmissionState,
+  type UncertainSubmissionStatus,
 };
 
 /** Remembering the last wallet turns a five-row decision into one tap on return. */
@@ -315,12 +313,31 @@ export interface WalletContextValue {
   transactionState: TransactionState | null;
 
   /**
-   * Monotonic nonsecret session revision counter.
-   * Increments whenever the connected account identity, network, or connector changes,
-   * allowing dependent balance and read hooks to invalidate their caches without
-   * leaking credentials or triggering on unrelated transaction signing intents.
+   * Active uncertain-submission recovery state when a signed transaction was
+   * submitted but its on-chain outcome is unknown. Exposes the transaction
+   * hash and `canResubmit: false` so UI never prompts users to resubmit a
+   * possibly successful payment.
    */
-  sessionRevision: number;
+  uncertainSubmission: UncertainSubmissionState | null;
+
+  /**
+   * Record an uncertain transaction submission by hash, entering the
+   * `"uncertain-submission"` lifecycle state and blocking resubmission.
+   */
+  recordUncertainSubmission: (
+    params: CreateUncertainSubmissionParams,
+  ) => UncertainSubmissionState;
+
+  /**
+   * Run one bounded reconciliation check for the active uncertain submission.
+   * Returns `null` when no uncertain submission is active.
+   */
+  reconcileUncertainSubmission: (
+    options?: ReconcileUncertainSubmissionOptions,
+  ) => Promise<UncertainSubmissionState | null>;
+
+  /** Clear the active uncertain-submission recovery state. */
+  clearUncertainSubmission: () => void;
 
   /** Rows for the picker modal, already ordered. */
   wallets: ModalWallet[];
@@ -424,7 +441,10 @@ const NO_WALLET = "Connect a Stellar wallet first.";
 
 const Ctx = createContext<WalletContextValue>({
   transactionState: null,
-  sessionRevision: 0,
+  uncertainSubmission: null,
+  recordUncertainSubmission: (params) => createUncertainSubmission(params),
+  reconcileUncertainSubmission: async () => null,
+  clearUncertainSubmission: () => {},
   address: null,
   isConnected: false,
   isConnecting: false,
@@ -471,13 +491,15 @@ const Ctx = createContext<WalletContextValue>({
  * - `"stale"`: Transaction confirmed on-chain but the wallet session lost sync (e.g. reconnect).
  * - `"disconnected"`: Wallet disconnected during a pending transaction.
  * - `"dependency-failure"`: A required upstream step (e.g. trustline) failed.
+ * - `"uncertain-submission"`: Transaction was submitted, but transport/timeout left its outcome uncertain; reconcile by hash instead of resubmitting.
  */
 export type TransactionState =
   | "loading"
   | "invalid"
   | "stale"
   | "disconnected"
-  | "dependency-failure";
+  | "dependency-failure"
+  | "uncertain-submission";
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
@@ -733,9 +755,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [networkWarning, setNetworkWarning] = useState<string | null>(null);
   // Exposed through the context for lifecycle feedback UI; nothing in the
   // provider drives it yet, so it stays `null` until a write flow sets it.
-  const [transactionState] = useState<TransactionState | null>(null);
-  const [sessionRevision, setSessionRevision] = useState(0);
-  const sessionRevisionRef = useRef(0);
+  const [transactionState, setTransactionState] = useState<TransactionState | null>(null);
+  const [uncertainSubmission, setUncertainSubmission] =
+    useState<UncertainSubmissionState | null>(null);
+  const uncertainSubmissionRef = useRef<UncertainSubmissionState | null>(null);
+  uncertainSubmissionRef.current = uncertainSubmission;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerLoading, setPickerLoading] = useState(false);
   const [options, setOptions] = useState<ShapedWallet[]>([]);
@@ -1224,6 +1248,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setWalletId(null);
     setWalletName(null);
     setNetworkWarning(null);
+    uncertainSubmissionRef.current = null;
+    setUncertainSubmission(null);
+    setTransactionState(null);
 
     // The recent-wallet hint deliberately survives: it is what makes coming
     // back one tap. Only the session is cleared.
@@ -1280,6 +1307,51 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     [options, recentId, connectWallet],
   );
 
+  const recordUncertainSubmission = useCallback(
+    (params: CreateUncertainSubmissionParams) => {
+      const next = createUncertainSubmission(params);
+      uncertainSubmissionRef.current = next;
+      setUncertainSubmission(next);
+      setTransactionState("uncertain-submission");
+      return next;
+    },
+    [],
+  );
+
+  const reconcileUncertainSubmission = useCallback(
+    async (options?: ReconcileUncertainSubmissionOptions) => {
+      const current = uncertainSubmissionRef.current;
+      if (!current) return null;
+
+      if (current.status === "uncertain" && current.attempts < current.maxAttempts) {
+        const reconciling: UncertainSubmissionState = {
+          ...current,
+          status: "reconciling",
+          canResubmit: false,
+        };
+        uncertainSubmissionRef.current = reconciling;
+        setUncertainSubmission(reconciling);
+      }
+
+      const updated = await reconcileUncertainSubmissionState(current, options);
+      uncertainSubmissionRef.current = updated;
+      setUncertainSubmission(updated);
+      setTransactionState(
+        updated.status === "uncertain" || updated.status === "reconciling"
+          ? "uncertain-submission"
+          : null,
+      );
+      return updated;
+    },
+    [],
+  );
+
+  const clearUncertainSubmission = useCallback(() => {
+    uncertainSubmissionRef.current = null;
+    setUncertainSubmission(null);
+    setTransactionState((prev) => (prev === "uncertain-submission" ? null : prev));
+  }, []);
+
   const value = useMemo<WalletContextValue>(
     () => ({
       address,
@@ -1297,7 +1369,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       canSignAuthEntries: supportsAuthEntrySigning(walletId),
       networkWarning,
       transactionState,
-      sessionRevision,
+      uncertainSubmission,
+      recordUncertainSubmission,
+      reconcileUncertainSubmission,
+      clearUncertainSubmission,
       wallets,
       pendingTrustlineIntent,
       requestTrustlineThen,
@@ -1322,7 +1397,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       walletId,
       networkWarning,
       transactionState,
-      sessionRevision,
+      uncertainSubmission,
+      recordUncertainSubmission,
+      reconcileUncertainSubmission,
+      clearUncertainSubmission,
       wallets,
       pendingTrustlineIntent,
       requestTrustlineThen,
