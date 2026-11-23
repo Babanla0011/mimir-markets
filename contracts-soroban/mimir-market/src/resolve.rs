@@ -524,15 +524,7 @@ pub fn claim_fees(env: &Env, who: Address) -> Result<i128, Error> {
     storage::clear_accrued_fees(env, &who); // effects before interaction
     storage::add_claimed_fees(env, &who, amount);
     storage::add_lifetime_fees_claimed(env, amount);
-
-    let unclassed = (amount - (plat_part + owner_part)).max(0);
-    if plat_part + unclassed > 0 {
-        storage::add_platform_fees_claimed(env, plat_part + unclassed);
-    }
-    if owner_part > 0 {
-        storage::add_agent_owner_fees_claimed(env, owner_part);
-    }
-
+    storage::add_claimed_fees(env, &who, amount);
     let usdc = storage::usdc(env)?;
     escrow::push(env, &usdc, &who, amount);
     events::FeeClaimed {

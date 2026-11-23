@@ -336,6 +336,10 @@ pub struct Claim {
     /// How many challengers have pulled their settlement. The last one absorbs
     /// whatever `remaining_escrow` is left, so truncation dust is never stranded.
     pub challenger_claims: u32,
+    /// Monotonic revision of this claim, starting at 1 on creation. Mutations
+    /// that finalise a lifecycle transition bump it so a reviewer can detect a
+    /// stale view before submitting the next mutation.
+    pub revision: u32,
     pub created_at: u64,
     /// Monotonic revision of this claim's stored state. Creation starts at 1
     /// and every successful lifecycle mutation increments it, so a reviewer can
@@ -699,7 +703,6 @@ pub enum Error {
     /// in). The write is refused so the contract never records an impossible
     /// state.
     ConservationViolation = 47,
-    /// The market is paused: state-changing operations that are not withdrawals
-    /// or fee pulls are refused.
+    /// New claims, challenges and resolutions are blocked while paused.
     Paused = 48,
 }

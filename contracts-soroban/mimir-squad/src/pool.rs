@@ -1,17 +1,17 @@
 //! Market lifecycle: create, deposit, withdraw, resolve, claim.
 
-use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::{Address, BytesN, Env, String};
 
 use crate::escrow;
 use crate::events;
 use crate::storage;
 use crate::types::{
-    CancelPreview, ClaimResult, EntitlementPage, Error, Market, ParticipantEntitlement,
-    PendingFeeRecipient, PendingOracle, SettlementReadiness, BPS_DIVISOR,
-    FEE_RECIPIENT_TIMELOCK_SECONDS, MAX_DURATION, MAX_ENTITLEMENT_PAGE, MAX_FEE_BPS,
-    MAX_PARTICIPANTS_PER_SIDE, MAX_QUESTION_BYTES, MAX_SQUAD_MEMBERS, MIN_DURATION,
-    ORACLE_TIMELOCK_SECONDS, RESULT_CANCELLED, SETTLEMENT_MANIFEST_VERSION, SIDE_A, SIDE_B,
+    ClaimResult, Error, Market, MigrationCompatibilityReport, PendingFeeRecipient, PendingOracle,
+    PoolMigrationState, SettlementReadiness, BPS_DIVISOR, FEE_RECIPIENT_TIMELOCK_SECONDS,
+    MAX_DURATION, MAX_FEE_BPS,
+    MAX_PARTICIPANTS_PER_SIDE, MAX_QUESTION_BYTES, MAX_SQUAD_MEMBERS, MIGRATION_REPORT_VERSION,
+    MIN_DURATION,
+    ORACLE_TIMELOCK_SECONDS, RESULT_CANCELLED, SIDE_A, SIDE_B,
 };
 
 /// The fee on one winning claim: `floor(profit * fee_bps / BPS_DIVISOR)`.
@@ -808,60 +808,135 @@ pub fn preview_claim_state(
     Ok(ClaimState::Claimable)
 }
 
-/// Append a new depositor to the side's participant roster. The roster is what
-/// `get_entitlements_page` walks; it mirrors the deposit entries exactly.
-pub fn entitlements_page(
+/// Pause or unpause new market creation and deposits.
+///
+/// The fee recipient is the pool's operations authority. Pause never gates
+/// withdrawals, claims or parked-payout retries: captors must always be able
+/// to exit, so `withdraw_before_deadline`, `claim`, `claim_parked_payout` and
+/// `claim_fees` never consult the flag.
+pub fn set_paused(env: &Env, paused: bool) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    storage::set_paused(env, paused);
+    Ok(())
+}
+
+/// Queue a fee-recipient rotation. The current fee recipient must authorize.
+/// The change is delayed so participants have notice before fee custody moves.
+pub fn queue_fee_recipient(env: &Env, new_recipient: Address) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    let executable_at = env
+        .ledger()
+        .timestamp()
+        .checked_add(FEE_RECIPIENT_TIMELOCK_SECONDS)
+        .ok_or(Error::Overflow)?;
+
+    storage::set_pending_fee_recipient(
+        env,
+        &PendingFeeRecipient {
+            next: new_recipient,
+            executable_at,
+        },
+    );
+    Ok(())
+}
+
+pub fn cancel_fee_recipient(env: &Env) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    if storage::pending_fee_recipient(env).is_none() {
+        return Err(Error::NoFeeRecipientQueued);
+    }
+    storage::clear_pending_fee_recipient(env);
+    Ok(())
+}
+
+/// Permissionless once the timelock has elapsed. Accrued but unclaimed fees
+/// follow the recipient address, so they pay the new recipient after rotation.
+pub fn execute_fee_recipient(env: &Env) -> Result<(), Error> {
+    let queued = storage::pending_fee_recipient(env).ok_or(Error::NoFeeRecipientQueued)?;
+    if env.ledger().timestamp() < queued.executable_at {
+        return Err(Error::Timelocked);
+    }
+    storage::set_fee_recipient(env, &queued.next);
+    storage::clear_pending_fee_recipient(env);
+    Ok(())
+}
+
+/// Versioned digest binding a resolved market's settlement state, so an
+/// off-chain manifest can be checked against the authoritative on-chain state.
+pub fn settlement_manifest(env: &Env, market_id: u64) -> Result<(u32, BytesN<32>), Error> {
+    let market = storage::get_market(env, market_id)?;
+    if !market.resolved {
+        return Err(Error::NotClaimable);
+    }
+    Ok((
+        SETTLEMENT_MANIFEST_VERSION,
+        settlement_manifest_digest(env, market_id, &market),
+    ))
+}
+
+/// Read-only migration compatibility report for one live squad pool.
+///
+/// Classifies the pool and reports the liabilities an upgrade must preserve,
+/// without moving funds or writing storage. Resolution does not change a
+/// pool's liabilities: the same `remaining_escrow` (or, before resolution, the
+/// pool totals) backs every outstanding claim afterwards.
+pub fn migration_compatibility_report(
     env: &Env,
     market_id: u64,
-    offset: u32,
-    limit: u32,
-) -> Result<EntitlementPage, Error> {
-    // An unknown market is an explicit error, matching `get_market`, rather
-    // than an empty page that a caller could mistake for "no participants".
-    storage::get_market(env, market_id)?;
-    if limit > MAX_ENTITLEMENT_PAGE {
-        return Err(Error::PageTooLarge);
-    }
-
-    let side_a = storage::participants(env, market_id, SIDE_A);
-    let side_b = storage::participants(env, market_id, SIDE_B);
-    let total = side_a
-        .len()
-        .checked_add(side_b.len())
+) -> Result<MigrationCompatibilityReport, Error> {
+    let market = storage::get_market(env, market_id)?;
+    let total = market
+        .pool_a
+        .checked_add(market.pool_b)
         .ok_or(Error::Overflow)?;
 
-    let start = offset.min(total);
-    let remaining = total - start;
-    let take = if limit == 0 {
-        remaining
+    let state = if !market.resolved {
+        PoolMigrationState::Unresolved
+    } else if market.remaining_escrow == 0 {
+        PoolMigrationState::Settled
+    } else if market.result == RESULT_CANCELLED {
+        PoolMigrationState::Cancelled
     } else {
-        limit.min(remaining)
+        PoolMigrationState::PartiallyClaimed
     };
 
-    let mut items: soroban_sdk::Vec<ParticipantEntitlement> = soroban_sdk::Vec::new(env);
-    let mut cursor = start;
-    while cursor < start + take {
-        // Roster order is SIDE_A, then SIDE_B, each in deposit order. The same
-        // `offset` over unchanged state always restarts at the same record.
-        let (side, index) = if cursor < side_a.len() {
-            (SIDE_A, cursor)
-        } else {
-            (SIDE_B, cursor - side_a.len())
-        };
-        let participant = if side == SIDE_A {
-            side_a.get(index)
-        } else {
-            side_b.get(index)
-        }
-        .ok_or(Error::Overflow)?;
-        items.push_back(entitlement(env, market_id, side, &participant)?);
-        cursor += 1;
-    }
+    // Before resolution every deposit is still owned by a user (and remains
+    // withdrawable until the deadline); after resolution only the remaining
+    // escrow is owed.
+    let outstanding_user_liability = if market.resolved {
+        market.remaining_escrow
+    } else {
+        total
+    };
 
-    Ok(EntitlementPage {
-        items,
-        offset: start,
-        total,
+    let compatible = assert_market_conservation(&market).is_ok()
+        && outstanding_user_liability >= 0
+        && outstanding_user_liability <= total;
+
+    Ok(MigrationCompatibilityReport {
+        version: MIGRATION_REPORT_VERSION,
+        market_id,
+        state,
+        resolved: market.resolved,
+        result: market.result,
+        pool_a: market.pool_a,
+        pool_b: market.pool_b,
+        remaining_escrow: market.remaining_escrow,
+        outstanding_user_liability,
+        winner_claims: market.winner_claims,
+        compatible,
+    })
+}
+
+/// Read-only settlement readiness. Never mutates state.
+pub fn settlement_readiness(env: &Env, market_id: u64) -> Result<SettlementReadiness, Error> {
+    let market = storage::get_market(env, market_id)?;
+    let now = env.ledger().timestamp();
+    Ok(SettlementReadiness {
+        resolved: market.resolved,
+        oracle_ready: market.resolved || now >= market.deadline,
+        withdrawal_open: !market.resolved && now < market.deadline,
+        remaining_escrow: market.remaining_escrow,
     })
 }
 

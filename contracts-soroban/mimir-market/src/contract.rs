@@ -11,11 +11,11 @@ use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, ContractLimits,
-    CreateParams, Error, FeePolicy, MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle,
-    PlatformStats, Verdict, WinnerSide, FEE_TIMELOCK_SECONDS, LIMITS_VERSION_V1, MAX_BATCH_SIZE,
-    MAX_CHALLENGERS, MAX_CLAIM_METADATA_BYTES, MAX_INVITE_KEY_BYTES, MAX_METADATA_BYTES,
-    MAX_TOTAL_FEE_BPS, ORACLE_TIMELOCK_SECONDS,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, ContractLimits, CreateParams,
+    Error, FeePolicy, MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats,
+    Verdict, WinnerSide, FEE_TIMELOCK_SECONDS, LIMITS_VERSION_V1, MAX_BATCH_SIZE, MAX_CHALLENGERS,
+    MAX_CLAIM_METADATA_BYTES, MAX_INVITE_KEY_BYTES, MAX_METADATA_BYTES, MAX_TOTAL_FEE_BPS,
+    ORACLE_TIMELOCK_SECONDS,
 };
 
 #[contract]

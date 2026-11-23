@@ -7,7 +7,7 @@ use crate::escrow;
 use crate::pool;
 use crate::storage;
 use crate::types::{
-    CancelPreview, ClaimResult, EntitlementPage, Error, Market, PendingOracle, SettlementReadiness,
+    ClaimResult, Error, Market, MigrationCompatibilityReport, PendingOracle, SettlementReadiness,
     SquadLimits, MAX_BATCH_SIZE, MAX_DURATION, MAX_FEE_BPS, MAX_QUESTION_BYTES, MIN_DURATION,
 };
 
@@ -79,7 +79,10 @@ impl MimirSquad {
     /// Read-only preview of the refundable liabilities that `cancel_market`
     /// would create for `market_id`. Performs no value movement or authority
     /// changes.
-    pub fn preview_cancel_market(env: Env, market_id: u64) -> Result<CancelPreview, Error> {
+    pub fn preview_cancel_market(
+        env: Env,
+        market_id: u64,
+    ) -> Result<(ClaimResult, ClaimResult), Error> {
         pool::preview_cancel_market(&env, market_id)
     }
 
@@ -205,6 +208,8 @@ impl MimirSquad {
         who: Address,
     ) -> Result<(i128, bool), Error> {
         let already_claimed = storage::has_claimed(&env, market_id, side, &who);
+        // `preview_claim` returns zero for a wallet with no position, so this
+        // read-only path never errors for an unknown participant.
         let claimable = pool::preview_claim(&env, market_id, side, &who)?.net;
         Ok((claimable, already_claimed))
     }
@@ -300,6 +305,17 @@ impl MimirSquad {
         } else {
             Err(Error::BatchTooLarge)
         }
+    }
+
+    /// Read-only migration compatibility report for a live squad pool.
+    ///
+    /// Reports the pool's lifecycle class and the outstanding user liability an
+    /// upgrade must preserve. Never mutates state or moves funds.
+    pub fn get_migration_report(
+        env: Env,
+        market_id: u64,
+    ) -> Result<MigrationCompatibilityReport, Error> {
+        pool::migration_compatibility_report(&env, market_id)
     }
 
     /// Read-only settlement readiness for a market. Never mutates state.

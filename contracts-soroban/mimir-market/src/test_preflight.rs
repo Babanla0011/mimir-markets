@@ -17,8 +17,7 @@ fn eligible_claim_preflights_true() {
     let f = Fixture::new(100, 50);
     let id = create_claim(&f, 10 * USDC);
     // Advance into Active (any challenger stake transitions Open -> Active).
-    f.client()
-        .challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
+    f.client().challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
     // Past the deadline.
     f.advance_by(3_600 + 1);
 
@@ -34,8 +33,7 @@ fn eligible_claim_preflights_true() {
 fn active_but_not_expired_preflights_false_with_reason() {
     let f = Fixture::new(100, 50);
     let id = create_claim(&f, 10 * USDC);
-    f.client()
-        .challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
+    f.client().challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
 
     let pf = f.client().preflight_claim(&id);
     assert!(!pf.eligible);
@@ -61,8 +59,7 @@ fn open_claim_preflights_false_with_not_active() {
 fn resolved_claim_preflights_false_with_not_active() {
     let f = Fixture::new(100, 50);
     let id = create_claim(&f, 10 * USDC);
-    f.client()
-        .challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
+    f.client().challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
     f.advance_by(3_600 + 1);
     f.client().resolve_claim(
         &id,
@@ -94,8 +91,7 @@ fn boundary_at_exact_deadline_is_eligible() {
     // exact instant the deadline is reached is eligible. Preflight must agree.
     let f = Fixture::new(100, 50);
     let id = create_claim(&f, 10 * USDC);
-    f.client()
-        .challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
+    f.client().challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
     let deadline = f.client().get_claim(&id).deadline;
     f.advance_to(deadline);
 
@@ -111,8 +107,7 @@ fn preflight_does_not_mutate_claim_state() {
     // escrow. Capture the full Claim before/after and compare.
     let f = Fixture::new(100, 50);
     let id = create_claim(&f, 10 * USDC);
-    f.client()
-        .challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
+    f.client().challenge_claim(&f.user(10 * USDC), &id, &(10 * USDC), &None);
     f.advance_by(3_600 + 1);
 
     let before = f.client().get_claim(&id);
@@ -130,6 +125,10 @@ fn preflight_does_not_mutate_claim_state() {
 #[test]
 fn unknown_claim_id_errors() {
     let f = Fixture::new(100, 50);
-    let err = f.client().try_preflight_claim(&99_999).unwrap_err().unwrap();
-    assert_eq!(err, Error::ClaimNotFound);
+    let err = f.client().try_preflight_claim(&99_999).unwrap_err();
+    assert_eq!(
+        err.unwrap(),
+        Error::ClaimNotFound,
+        "preflight on a missing claim must report the contract error"
+    );
 }

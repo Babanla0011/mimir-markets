@@ -106,65 +106,8 @@ pub struct ClaimResult {
     pub net: i128,
 }
 
-/// One participant's read-only entitlement in a squad market.
-///
-/// Amounts are exact integer USDC atomic units, computed by the same helpers
-/// `claim` uses, so a record never disagrees with the payout it previews.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParticipantEntitlement {
-    pub participant: Address,
-    pub side: u32,
-    /// Deposited amount on this side, before any payout.
-    pub principal: i128,
-    /// Gross payout the participant would receive, before fees.
-    pub gross: i128,
-    /// Fee charged on profit only.
-    pub fee: i128,
-    /// Amount the participant would receive: `gross - fee`.
-    pub net: i128,
-    /// Whether the participant has already pulled this position.
-    pub claimed: bool,
-}
-
-/// A paginated window into a squad market's participant entitlements.
-///
-/// `items` holds up to `limit` records starting at `offset`, ordered by side
-/// (`SIDE_A` entries first, then `SIDE_B`), each side in deposit order.
-/// `total` is the full roster length so a caller can detect the last page
-/// without fetching an extra empty one.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntitlementPage {
-    pub items: Vec<ParticipantEntitlement>,
-    /// Roster position of the first item returned, clamped to `total`.
-    pub offset: u32,
-    /// Total number of participants across both sides, not just this page.
-    pub total: u32,
-}
-
-/// Refundable liabilities a cancellation of `market_id` would create.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CancelPreview {
-    pub refund_a: i128,
-    pub refund_b: i128,
-}
-
-/// Read-only settlement readiness for one market. Reported independently of
-/// `resolved` so a caller can tell whether pre-deadline withdrawals are still
-/// open, and whether the oracle may resolve yet.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SettlementReadiness {
-    pub resolved: bool,
-    pub oracle_ready: bool,
-    pub withdrawal_open: bool,
-    pub remaining_escrow: i128,
-}
-
-/// The policy limits `create_market` enforces, so clients can read them
-/// instead of probing live calls for failures.
+/// Protocol limits enforced by `create_market`, exposed for clients so a UI can
+/// validate a market before submitting it.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SquadLimits {
@@ -172,6 +115,65 @@ pub struct SquadLimits {
     pub min_duration: u64,
     pub max_duration: u64,
     pub max_question_bytes: u32,
+}
+
+/// Lifecycle class of a live squad pool as seen by the migration compatibility
+/// report. Every pool falls in exactly one class, whether it has been upgraded
+/// yet or not.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolMigrationState {
+    /// Not resolved: both sides still hold deposits, withdrawable pre-deadline.
+    Unresolved = 0,
+    /// Resolved as cancelled with refunds still unclaimed.
+    Cancelled = 1,
+    /// Resolved on a winning side with winner payouts still outstanding.
+    PartiallyClaimed = 2,
+    /// Resolved and fully drained: nothing is owed to anyone.
+    Settled = 3,
+}
+
+/// Version tag for the migration compatibility report. Bump if the report's
+/// shape changes so an operator can reject an unknown report.
+pub const MIGRATION_REPORT_VERSION: u32 = 1;
+
+/// Read-only compatibility snapshot for one live squad pool, used before and
+/// after an upgrade.
+///
+/// `outstanding_user_liability` is the amount the pool still owes to users:
+/// for an unresolved pool that is both pools (every deposit is still
+/// withdrawable), for a resolved pool it is the remaining escrow. The report
+/// never moves funds and never mutates state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCompatibilityReport {
+    pub version: u32,
+    pub market_id: u64,
+    pub state: PoolMigrationState,
+    pub resolved: bool,
+    pub result: u32,
+    pub pool_a: i128,
+    pub pool_b: i128,
+    pub remaining_escrow: i128,
+    pub outstanding_user_liability: i128,
+    pub winner_claims: u32,
+    /// `false` when the stored market breaks an accounting invariant (for
+    /// example `remaining_escrow > pool_a + pool_b`, or a negative balance).
+    /// A report is still returned so an operator can see the corruption, but
+    /// an incompatible pool must not be migrated as-is.
+    pub compatible: bool,
+}
+
+/// Read-only settlement readiness for one market: whether it is already
+/// resolved, whether the oracle may resolve it now, whether pre-deadline
+/// withdrawals are still open, and the escrow still owed to winners.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementReadiness {
+    pub resolved: bool,
+    pub oracle_ready: bool,
+    pub withdrawal_open: bool,
+    pub remaining_escrow: i128,
 }
 
 /// Versioned, digest-bound settlement manifest. Binds the winning side, fee
@@ -263,10 +265,6 @@ pub enum Error {
     UnsupportedManifestVersion = 35,
     /// The settlement manifest digest does not match the bound market state.
     ManifestDigestMismatch = 36,
-    /// `get_entitlements_page` was called with a `limit` above
-    /// [`MAX_ENTITLEMENT_PAGE`]. Refused before reading any entitlement.
-    PageTooLarge = 37,
-    /// The pool is paused: new deposits and market creation are refused while
-    /// withdrawals, claims and parked-payout retries stay available.
-    Paused = 38,
+    /// New market creation or deposits are blocked while the pool is paused.
+    Paused = 37,
 }
