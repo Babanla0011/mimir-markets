@@ -6,13 +6,8 @@
  * not a user-facing API, so every handler is gated on the `internal_worker` tier
  * and the shared `CRON_SECRET` — the same pattern as the cron routes. An unset
  * `CRON_SECRET` refuses rather than waving callers through.
- *
- * Approval is bound to an immutable canonical market draft digest. When a
- * `complete` approval is recorded, the caller must present the digest of the
- * draft they reviewed (computed over wording, source commitment, stake and
- * deadline). Execution is then refused if the stored draft no longer matches
- * the approved digest, so any post-approval change to an approved draft field
- * invalidates the approval.
+ * GET query parameters must be single-valued; repeated keys are rejected instead
+ * of silently selecting one occurrence.
  */
 
 import { createHash } from "crypto";
@@ -164,17 +159,17 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const denied = await requireAuth(request);
   if (denied) return denied;
 
+  const { searchParams } = new URL(request.url);
+  const queryKeys = new Set(searchParams.keys());
+  if ([...queryKeys].some((key) => searchParams.getAll(key).length > 1)) {
+    return errorResponse("Duplicate query parameters are not allowed", 400);
+  }
+
   if (!isDbConfigured()) {
     return errorResponse("Database not configured", 503);
   }
 
-  const { searchParams } = new URL(request.url);
-  const exportType = searchParams.get("export");
-  const isTriage =
-    exportType === "triage" ||
-    searchParams.get("view") === "triage" ||
-    searchParams.get("triage") === "true";
-
+  const statusRaw = searchParams.get("status");
   const limitRaw = searchParams.get("limit");
   const offsetRaw = searchParams.get("offset");
   const limit = parseIntParam(limitRaw);

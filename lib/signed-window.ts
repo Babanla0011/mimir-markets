@@ -83,58 +83,11 @@ export type SignedWindowResult =
   | { ok: true; nonce: string; expiresAt: number }
   | { ok: false; code: "invalid_request" | "request_expired"; message: string; field: "nonce" | "expiresAt" };
 
-export type RevisionValidationResult =
-  | { ok: true; expectedRevision?: number }
-  | {
-      ok: false;
-      code: "invalid_request" | "conflict";
-      message: string;
-      field: "expectedRevision";
-    };
-
-export type SignedWindowResult =
-  | { ok: true; nonce: string; expiresAt: number; expectedRevision?: number }
-  | {
-      ok: false;
-      code: "invalid_request" | "request_expired" | "conflict";
-      message: string;
-      field: "nonce" | "expiresAt" | "expectedRevision";
-    };
-
 /**
- * Validate that an expected proposal review revision is a non-negative safe
- * integer and not behind the current revision.
- */
-export function validateReviewRevision(
-  rawExpectedRevision: unknown,
-  currentRevision?: number,
-): RevisionValidationResult {
-  if (rawExpectedRevision === undefined) {
-    return { ok: true };
-  }
-  const rev = typeof rawExpectedRevision === "number" ? rawExpectedRevision : Number.NaN;
-  if (!Number.isSafeInteger(rev) || rev < 0) {
-    return {
-      ok: false,
-      code: "invalid_request",
-      message: "expectedRevision must be a non-negative safe integer",
-      field: "expectedRevision",
-    };
-  }
-  if (typeof currentRevision === "number" && rev < currentRevision) {
-    return {
-      ok: false,
-      code: "conflict",
-      message: `proposal review revision is stale: expected revision ${rev} is behind current revision ${currentRevision}`,
-      field: "expectedRevision",
-    };
-  }
-  return { ok: true, expectedRevision: rev };
-}
-
-/**
- * Validate the nonce shape, that `expiresAt` is in (now, now + max TTL], and
- * optionally that `expectedRevision` is not stale.
+ * Validate the nonce shape and that `expiresAt` is in (now, now + max TTL].
+ * Nonce whitespace is normalized for compatibility; timestamps must already be
+ * safe-integer millisecond numbers. Arrays are refused rather than selecting a
+ * value from a repeated parameter list.
  */
 export function validateSignedWindow(
   rawNonce: unknown,
@@ -142,13 +95,9 @@ export function validateSignedWindow(
   optionsOrNow: SignedWindowOptions | number = Date.now(),
   maybeCurrentRevision?: number,
 ): SignedWindowResult {
-  const options: SignedWindowOptions =
-    typeof optionsOrNow === "number"
-      ? { now: optionsOrNow, currentRevision: maybeCurrentRevision }
-      : optionsOrNow;
-  const now = options.now ?? Date.now();
-  const currentRevision = options.currentRevision ?? maybeCurrentRevision;
-
+  if (Array.isArray(rawNonce)) {
+    return { ok: false, code: "invalid_request", message: "nonce must be provided exactly once", field: "nonce" };
+  }
   const nonce = typeof rawNonce === "string" ? rawNonce.trim() : "";
   if (!NONCE_PATTERN.test(nonce)) {
     return {
@@ -157,6 +106,9 @@ export function validateSignedWindow(
       message: "nonce must be 16-128 characters of [A-Za-z0-9_-]",
       field: "nonce",
     };
+  }
+  if (Array.isArray(rawExpiresAt)) {
+    return { ok: false, code: "invalid_request", message: "expiresAt must be provided exactly once", field: "expiresAt" };
   }
   const expiresAt = typeof rawExpiresAt === "number" ? rawExpiresAt : Number.NaN;
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) {
