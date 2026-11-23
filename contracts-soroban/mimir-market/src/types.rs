@@ -467,35 +467,42 @@ pub struct PlatformStats {
     pub fees_claimed: i128,
 }
 
-// ── Resolution expiration policy ─────────────────────────────────────────────
-
-/// Read-only descriptor of the currently approved oracle resolution and claim
-/// expiration policy enforced on chain.
+/// Completeness and aggregate liability for a payout preview across claim history.
+///
+/// When claim history is read across a paginated window, truncated slice, or
+/// sparse set of IDs, the preview aggregates liabilities across observed claims
+/// while explicitly reporting whether all observations were accounted for.
+///
+/// Invariant: `verified_total_liability` is `Some(amount)` ONLY when
+/// `is_complete` is true (`missing_observations == 0` and not truncated).
+/// An incomplete aggregate is NEVER presented as a verified total liability.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolutionExpirationPolicy {
-    /// Whether active claims can only be resolved by the configured oracle.
-    pub oracle_only_resolution: bool,
-    /// Anti-sniping buffer (seconds) before `deadline` during which new
-    /// challenges are rejected (`CHALLENGE_LOCK_SECONDS`).
-    pub challenge_lock_seconds: u64,
-    /// Timelock delay (seconds) for rotating the oracle (`ORACLE_TIMELOCK_SECONDS`).
-    pub oracle_timelock_seconds: u64,
-    /// Post-deadline resolution expiration window in seconds.
-    /// `0` indicates no post-deadline expiry / no permissionless timeout
-    /// fallback for active claims; oracle resolution remains authoritative.
-    pub resolution_expiry_seconds: u64,
-    /// Whether an unchallenged `Open` claim at or after `deadline` can be
-    /// permissionlessly cancelled via `transition_deadline` with full creator
-    /// refund.
-    pub open_claim_expiry_cancels: bool,
-    /// Whether an `Active` claim auto-expires or refunds without oracle
-    /// resolution.
-    pub active_claim_auto_expires: bool,
-    /// Currently supported on-chain verdict encoding version (`VERDICT_VERSION_V1`).
-    pub verdict_version: u32,
-    /// Maximum valid oracle confidence score (`MAX_CONFIDENCE`, 0..=100).
-    pub max_confidence: u32,
+pub struct PayoutPreview {
+    /// Aggregate liability computed across all observed claims in the window/slice.
+    pub aggregate_liability: i128,
+    /// Verified total liability across full claim history. Populated (`Some`)
+    /// ONLY when the preview is complete (no truncation, no missing observations).
+    /// `None` when the preview is incomplete so an incomplete aggregate is never
+    /// presented as a verified total liability.
+    pub verified_total_liability: Option<i128>,
+    /// Aggregate gross payouts across observed claims.
+    pub aggregate_gross: i128,
+    /// Aggregate fees across observed claims.
+    pub aggregate_fees: i128,
+    /// Aggregate net payouts across observed claims.
+    pub aggregate_net: i128,
+    /// Number of claims successfully observed and included in this preview.
+    pub observed_count: u32,
+    /// Total number of claims in the creator's history or requested scope.
+    pub total_claims: u32,
+    /// Number of unobserved claims (either truncated beyond the window or
+    /// missing from storage). Marked explicitly so callers can detect omissions.
+    pub missing_observations: u32,
+    /// True if the history slice was truncated by offset or limit.
+    pub is_truncated: bool,
+    /// True ONLY if all claims in history were observed and accounted for.
+    pub is_complete: bool,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -574,8 +581,5 @@ pub enum Error {
     /// in). The write is refused so the contract never records an impossible
     /// state.
     ConservationViolation = 47,
-    /// A queued fee-policy change was approved against a revision that is no
-    /// longer the active policy. The stale change is rejected and the active
-    /// policy and all balances are left untouched.
-    StaleFeePolicyRevision = 48,
+    Paused = 48,
 }
