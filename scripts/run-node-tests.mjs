@@ -302,6 +302,10 @@ export function buildTestEnvironment({ sourceEnvironment = process.env, cacheDir
     if (key in sourceEnvironment) env[key] = sourceEnvironment[key];
   }
 
+  if (!env.PATH && sourceEnvironment.Path) {
+    env.PATH = sourceEnvironment.Path;
+  }
+
   if (includeDatabase) {
     for (const key of DATABASE_ENV_KEYS) {
       if (key in sourceEnvironment) env[key] = sourceEnvironment[key];

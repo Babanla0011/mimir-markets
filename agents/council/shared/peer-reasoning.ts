@@ -28,24 +28,145 @@ import {
   type CouncilBallotCommitment,
 } from "../../../lib/council/quorum";
 import { usdcToUnits } from "../../../lib/usdc";
+import { sha256Hex } from "../../../lib/content-hash";
 import {
   type PersonaSpec,
   personaSecretEnv,
 } from "../personas";
 
-export {
-  BallotCommitmentError,
-  COUNCIL_BALLOT_COMMITMENT_VERSION,
-  createBallotCommitment,
-  verifyBallotCommitment,
-  type BallotCommitmentFailureReason,
-  type BallotCommitmentVerification,
-  type BallotParticipantIdentity,
-  type BallotParticipantInput,
-  type CouncilBallotCommitment,
-};
+export interface ClaimStatementInput {
+  question?: string;
+  creatorPosition?: string;
+  creator_position?: string;
+  sideA?: string;
+  counterPosition?: string;
+  counter_position?: string;
+  opponent_position?: string;
+  sideB?: string;
+  resolutionUrl?: string;
+  resolution_url?: string;
+  settlementRule?: string;
+  settlement_rule?: string;
+  contextHash?: string;
+  context_hash?: string;
+}
 
-export const PEER_REASONING_COMMITMENT_VERSION = COUNCIL_BALLOT_COMMITMENT_VERSION;
+/**
+ * Computes a deterministic SHA-256 digest over a claim's statement wording
+ * (question, creator position, counter position) and source commitment
+ * (resolution URL, settlement rule, context hash).
+ *
+ * Any change to wording or source commitment produces a different digest,
+ * invalidating cached peer reasoning while preserving entries for unrelated claims.
+ */
+export function claimStatementDigest(claim: ClaimStatementInput): string {
+  const question = (claim.question ?? "").trim();
+  const creatorPos = (claim.creatorPosition ?? claim.creator_position ?? claim.sideA ?? "").trim();
+  const counterPos = (claim.counterPosition ?? claim.counter_position ?? claim.opponent_position ?? claim.sideB ?? "").trim();
+  const sourceUrl = (claim.resolutionUrl ?? claim.resolution_url ?? "").trim();
+  const rule = (claim.settlementRule ?? claim.settlement_rule ?? "").trim();
+  const ctxHash = (claim.contextHash ?? claim.context_hash ?? "").trim().toLowerCase();
+
+  const payload = [
+    `question:${question}`,
+    `creator:${creatorPos}`,
+    `counter:${counterPos}`,
+    `source:${sourceUrl}`,
+    `rule:${rule}`,
+    `context:${ctxHash}`,
+  ].join("\n");
+
+  return sha256Hex(payload);
+}
+
+/** Upper bound on cached peer reasoning entries so memory stays bounded. */
+export const PEER_REASONING_CACHE_MAX_ENTRIES = 500;
+
+export interface PersistedPeerReasoning {
+  claimId: number;
+  buyerSlug: string;
+  statementDigest: string;
+  reads: PeerReasoningRead[];
+  cachedAt: number;
+}
+
+const persistentPeerReasoningCache = new Map<string, PersistedPeerReasoning>();
+
+export function peerReasoningCacheKey(
+  claimId: number,
+  buyerSlug: string,
+  statementDigest?: string,
+): string {
+  return statementDigest ? `${claimId}:${buyerSlug}:${statementDigest}` : `${claimId}:${buyerSlug}`;
+}
+
+export function getCachedPeerReasoning(
+  claimId: number,
+  buyerSlug: string,
+  statementDigest?: string,
+): PeerReasoningRead[] | null {
+  if (statementDigest) {
+    const key = peerReasoningCacheKey(claimId, buyerSlug, statementDigest);
+    const hit = persistentPeerReasoningCache.get(key);
+    if (hit) return hit.reads;
+    return null;
+  }
+  for (const [, value] of persistentPeerReasoningCache) {
+    if (value.claimId === claimId && value.buyerSlug === buyerSlug) {
+      return value.reads;
+    }
+  }
+  return null;
+}
+
+export function setCachedPeerReasoning(
+  claimId: number,
+  buyerSlug: string,
+  reads: PeerReasoningRead[],
+  statementDigest = "",
+  nowMs = Date.now(),
+): void {
+  const key = peerReasoningCacheKey(claimId, buyerSlug, statementDigest);
+  persistentPeerReasoningCache.delete(key);
+  persistentPeerReasoningCache.set(key, {
+    claimId,
+    buyerSlug,
+    statementDigest,
+    reads,
+    cachedAt: nowMs,
+  });
+  while (persistentPeerReasoningCache.size > PEER_REASONING_CACHE_MAX_ENTRIES) {
+    const oldest = persistentPeerReasoningCache.keys().next().value;
+    if (oldest === undefined) break;
+    persistentPeerReasoningCache.delete(oldest);
+  }
+}
+
+export function clearPeerReasoningCache(): void {
+  persistentPeerReasoningCache.clear();
+}
+
+export function peerReasoningCacheSize(): number {
+  return persistentPeerReasoningCache.size;
+}
+
+export function prunePeerReasoningCache(joinableClaimIds: ReadonlySet<number>): void {
+  for (const [key, value] of persistentPeerReasoningCache) {
+    if (!joinableClaimIds.has(value.claimId)) {
+      persistentPeerReasoningCache.delete(key);
+    }
+  }
+}
+
+export function invalidatePeerReasoning(claimId: number, statementDigest?: string): void {
+  for (const [key, value] of persistentPeerReasoningCache) {
+    if (value.claimId === claimId) {
+      if (!statementDigest || value.statementDigest === statementDigest) {
+        persistentPeerReasoningCache.delete(key);
+      }
+    }
+  }
+}
 
 export interface PeerReasoningRead {
   kind: "reasoning";
@@ -874,8 +995,29 @@ export async function buyPeerReasoning(args: {
 }): Promise<PeerReadOutcome[]> {
   if (args.readsPerPersona <= 0) return [];
 
-  const payer = args.payer !== undefined ? args.payer : payingWalletForPersona(args.buyer);
-  if (!payer) return [];
+  if (!args.skipCache && statementDigest) {
+    const cached = getCachedPeerReasoning(args.claimId, args.buyer.slug, statementDigest);
+    if (cached && cached.length > 0) {
+      return {
+        reads: cached,
+        outages: [],
+        conflicts: [],
+        remainingUnits: capUnits,
+        totalPaidUnits: 0n,
+      };
+    }
+  }
+
+  const payer =
+    args.payer !== undefined
+      ? args.payer
+      : payingWalletForPersona(args.buyer);
+  if (!payer) return emptyOutcome;
+
+  const doFetch = args.fetchWithBudgetImpl ?? fetchWithBudget;
+  const sleep =
+    args.sleepFn ??
+    ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   const policyRevision = args.policyRevision ?? PEER_REASONING_POLICY_REVISION;
   const sellers = selectPeerSellers(
@@ -906,15 +1048,11 @@ export async function buyPeerReasoning(args: {
     let url =
       `${args.baseUrl.replace(/\/$/, "")}/api/council/reasoning` +
       `?claimId=${encodeURIComponent(String(args.claimId))}` +
-      `&persona=${encodeURIComponent(seller.slug)}`;
-    if (expectedRevision !== null) {
-      url += `&claimRevision=${encodeURIComponent(expectedRevision)}`;
-    }
+      `&persona=${encodeURIComponent(seller.slug)}` +
+      (statementDigest ? `&statementDigest=${encodeURIComponent(statementDigest)}` : "");
 
     try {
-      // Trace header on the same request as the payment: a peer's paid read and
-      // the persona's decision cycle are one trace. Inert to the x402 proof.
-      const result = await fetchFn(url, payer, remainingUnits, {
+      let fetchPromise = doFetch(url, payer, remainingUnits, {
         method: "GET",
         headers: { accept: "application/json", ...outboundTraceHeaders() },
       });
@@ -949,18 +1087,29 @@ export async function buyPeerReasoning(args: {
       reads.push(readEntry);
 
       if (result.payment) {
-        remainingUnits -= result.payment.priceUnits;
+        remainingUnits -= priceUnits;
+        totalPaidUnits += priceUnits;
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isTimeout = /timeout|timed out/i.test(message);
+      const outage: PeerOutageReport = {
+        sellerSlug: seller.slug,
+        status: isTimeout ? "timeout" : "network_error",
+        message,
+      };
+      outages.push(outage);
+      if (args.onOutage) args.onOutage(outage);
+
       console.warn(
         `[council:${args.buyer.slug}] peer read failed from ${seller.slug}:`,
-        err instanceof Error ? err.message : err,
+        message,
       );
       if (Date.now() >= deadlineAt) deadlineHit = true;
     }
 
     if (args.delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, args.delayMs));
+      await sleep(args.delayMs);
     }
   }
 

@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { isVerdict, type Verdict } from "../verdict";
 
 /** Claim lifecycle states the quorum gate cares about. */
-export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled" | "paused";
+export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled" | "paused" | "expired";
 
 /**
  * What happened to one persona vote attempt before it may enter the ballot.
@@ -41,9 +41,11 @@ export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled" | "p
  * - **stale** — wrong claim id/revision, already-resolved claim, aged past maxAgeMs, or recorded after voting boundary.
  * - **duplicated** — same persona already accepted onto this ballot.
  * - **cancelled** — claim is cancelled; council must not settle it.
- * - **paused** — persona or claim is paused; vote does not count.
+ * - **paused** — persona or claim is paused; council must not settle it.
  * - **dependency_failure** — network / timeout / 5xx; treated as abstention for
  *   tally purposes but recorded so fallback reasons stay auditable.
+ * - **equivocation** — persona submitted contradictory/conflicting votes.
+ * - **expired** — ballot or vote submission deadline has elapsed.
  */
 export type VoteDisposition =
   | "valid"
@@ -71,6 +73,8 @@ export type FallbackAction =
   | "abort_resolved"
   /** Claim is paused — council must not settle it. */
   | "abort_paused"
+  /** Ballot or settlement window has expired — council settlement aborted. */
+  | "abort_expired"
   /** Quorum config is unusable after normalization refusal. */
   | "abort_invalid_config"
   /** Deadline passed with too few decisive votes — oracle settles solo, never by default consensus. */
@@ -159,12 +163,14 @@ export interface VoteAttemptInput {
   ageMs?: number;
   /** Responses older than this are stale (optional). */
   maxAgeMs?: number;
-  /**
-   * Optional arrival/delivery identity for this vote attempt (e.g. request id,
-   * trace id, or receipt id). Preserved on the accepted ballot entry so
-   * deduplicated retries reference the original arrival identity.
-   */
-  arrivalId?: string;
+  /** True when this vote submission or ballot is explicitly expired. */
+  expired?: boolean;
+  /** Deadline timestamp in ms; submission past this is marked expired. */
+  ballotDeadlineMs?: number;
+  /** Submission timestamp in ms. */
+  submittedAtMs?: number;
+  /** Explicitly marks this attempt as an equivocation / conflicting vote. */
+  equivocated?: boolean;
 }
 
 export interface ClassifiedVote {
@@ -396,6 +402,37 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     };
   }
 
+  if (input.claimState === "expired" || input.expired) {
+    return {
+      slug,
+      disposition: "expired",
+      reason: "ballot or vote submission has expired",
+      decisive: false,
+    };
+  }
+
+  if (
+    input.ballotDeadlineMs != null &&
+    input.submittedAtMs != null &&
+    input.submittedAtMs > input.ballotDeadlineMs
+  ) {
+    return {
+      slug,
+      disposition: "expired",
+      reason: `vote submitted at ${input.submittedAtMs}ms exceeds deadline ${input.ballotDeadlineMs}ms`,
+      decisive: false,
+    };
+  }
+
+  if (input.equivocated) {
+    return {
+      slug,
+      disposition: "equivocation",
+      reason: "conflicting vote attempt detected (equivocation)",
+      decisive: false,
+    };
+  }
+
   if (input.claimState === "cancelled") {
     return {
       slug,
@@ -511,21 +548,41 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
   };
 }
 
+export interface BuildBallotOptions {
+  /**
+   * When true, detecting conflicting verdicts for the same persona treats
+   * them as equivocation rather than benign duplicates.
+   */
+  rejectEquivocation?: boolean;
+  /**
+   * Strategy when a persona submits conflicting votes:
+   * - "disqualify_all": remove prior vote from ballot and reject both attempts
+   *   with disposition "equivocation" (conservative default when rejectEquivocation is true).
+   * - "reject_subsequent": keep prior vote, reject subsequent conflicting vote as "equivocation".
+   * - "drop_duplicate": legacy behavior (keep prior vote, mark subsequent as "duplicated").
+   */
+  equivocationPolicy?: "disqualify_all" | "reject_subsequent" | "drop_duplicate";
+}
+
 /**
- * Fold classified attempts into a ballot: first valid vote per slug wins and
- * its original arrival identity is preserved.
- *
- * - Identical retries (same verdict and confidence) are deduplicated
- *   idempotently and reference the original arrival identity.
- * - Conflicting duplicates (different verdict or confidence) are rejected as
- *   duplicated and surfaced as explicit inconsistencies in `conflicts`.
+ * Fold classified attempts into a ballot: first valid vote per slug wins;
+ * later attempts for the same slug are marked duplicated and dropped
+ * (or handled according to equivocation policy when configured).
  */
-export function buildBallot(classified: ClassifiedVote[]): {
+export function buildBallot(
+  classified: ClassifiedVote[],
+  opts?: BuildBallotOptions,
+): {
   ballot: ClassifiedVote[];
   rejected: ClassifiedVote[];
   conflicts: DuplicateVoteConflict[];
 } {
-  const acceptedBySlug = new Map<string, ClassifiedVote>();
+  const policy =
+    opts?.equivocationPolicy ??
+    (opts?.rejectEquivocation ? "disqualify_all" : "drop_duplicate");
+
+  const seen = new Map<string, ClassifiedVote>();
+  const disqualified = new Set<string>();
   const ballot: ClassifiedVote[] = [];
   const rejected: ClassifiedVote[] = [];
   const conflicts: DuplicateVoteConflict[] = [];
@@ -535,32 +592,12 @@ export function buildBallot(classified: ClassifiedVote[]): {
       rejected.push(vote);
       continue;
     }
-    const original = acceptedBySlug.get(vote.slug);
-    if (original) {
-      const isConflict =
-        vote.verdict !== original.verdict || vote.confidence !== original.confidence;
-      const originalRef = original.arrivalId ? ` (arrival '${original.arrivalId}')` : "";
-      const reason = isConflict
-        ? `conflicting duplicate vote for persona '${vote.slug}': original ${original.verdict}(${original.confidence})${originalRef} vs duplicate ${vote.verdict}(${vote.confidence})${vote.arrivalId ? ` (arrival '${vote.arrivalId}')` : ""}`
-        : `duplicate vote for persona '${vote.slug}' (idempotent retry${original.arrivalId ? ` of arrival '${original.arrivalId}'` : ""})`;
 
-      if (isConflict) {
-        conflicts.push({
-          slug: vote.slug,
-          ...(original.arrivalId ? { originalArrivalId: original.arrivalId } : {}),
-          ...(vote.arrivalId ? { duplicateArrivalId: vote.arrivalId } : {}),
-          originalVerdict: original.verdict,
-          duplicateVerdict: vote.verdict,
-          originalConfidence: original.confidence,
-          duplicateConfidence: vote.confidence,
-          reason,
-        });
-      }
-
+    if (disqualified.has(vote.slug)) {
       rejected.push({
         ...vote,
-        disposition: "duplicated",
-        reason,
+        disposition: "equivocation",
+        reason: `persona '${vote.slug}' is disqualified for equivocation`,
         decisive: false,
         verdict: undefined,
         confidence: undefined,
@@ -569,7 +606,74 @@ export function buildBallot(classified: ClassifiedVote[]): {
       });
       continue;
     }
-    acceptedBySlug.set(vote.slug, vote);
+
+    const prior = seen.get(vote.slug);
+    if (prior) {
+      const isConflict = prior.verdict !== vote.verdict;
+      if (!isConflict) {
+        // Benign duplicate (same verdict)
+        rejected.push({
+          ...vote,
+          disposition: "duplicated",
+          reason: `duplicate vote for persona '${vote.slug}'`,
+          decisive: false,
+          verdict: undefined,
+          confidence: undefined,
+        });
+        continue;
+      }
+
+      // Conflicting verdicts (equivocation)
+      if (policy === "drop_duplicate") {
+        rejected.push({
+          ...vote,
+          disposition: "duplicated",
+          reason: `duplicate vote for persona '${vote.slug}'`,
+          decisive: false,
+          verdict: undefined,
+          confidence: undefined,
+        });
+        continue;
+      }
+
+      if (policy === "reject_subsequent") {
+        rejected.push({
+          ...vote,
+          disposition: "equivocation",
+          reason: `conflicting vote for persona '${vote.slug}' (equivocation)`,
+          decisive: false,
+          verdict: undefined,
+          confidence: undefined,
+        });
+        continue;
+      }
+
+      // policy === "disqualify_all" (conservative default)
+      disqualified.add(vote.slug);
+      const priorIndex = ballot.findIndex((v) => v.slug === vote.slug);
+      if (priorIndex !== -1) {
+        const [evicted] = ballot.splice(priorIndex, 1);
+        rejected.push({
+          ...evicted,
+          disposition: "equivocation",
+          reason: `disqualified for conflicting votes (equivocation)`,
+          decisive: false,
+          verdict: undefined,
+          confidence: undefined,
+        });
+      }
+      rejected.push({
+        ...vote,
+        disposition: "equivocation",
+        reason: `conflicting vote for persona '${vote.slug}' (equivocation)`,
+        decisive: false,
+        verdict: undefined,
+        confidence: undefined,
+      });
+      continue;
+    }
+
+    seen.set(vote.slug, vote);
     ballot.push(vote);
   }
 
@@ -584,717 +688,19 @@ function countDispositions(
   return counts;
 }
 
-// ── Versioned Council Ballot Commitment ──────────────────────────────────────
-
-function failCommitment(reason: BallotCommitmentFailureReason, message: string): never {
-  throw new BallotCommitmentError(reason, message);
-}
-
-function normalizeEligibleVoteSet(raw: readonly string[] | undefined): string[] {
-  if (!Array.isArray(raw) || raw.length === 0) {
-    failCommitment("invalid_eligible_vote_set", "eligibleVoteSet must be a non-empty array of persona slugs");
-  }
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const entry of raw) {
-    if (typeof entry !== "string") {
-      failCommitment("invalid_eligible_vote_set", "eligibleVoteSet entries must be strings");
-    }
-    const slug = entry.trim().toLowerCase();
-    if (!slug || CONTROL_OR_SEP.test(slug)) {
-      failCommitment("invalid_eligible_vote_set", `invalid eligible persona slug '${String(entry)}'`);
-    }
-    if (seen.has(slug)) {
-      failCommitment("invalid_eligible_vote_set", `duplicate eligible persona slug '${slug}'`);
-    }
-    seen.add(slug);
-    normalized.push(slug);
-  }
-  return normalized.sort((a, b) => a.localeCompare(b));
-}
-
-function normalizeParticipantIdentities(
-  raw: readonly BallotParticipantInput[] | undefined,
-  eligibleVoteSet: readonly string[],
-  votes: readonly ClassifiedVote[],
-): BallotParticipantIdentity[] {
-  const eligibleSet = new Set(eligibleVoteSet);
-  const bySlug = new Map<string, BallotParticipantIdentity>();
-
-  if (raw !== undefined) {
-    if (!Array.isArray(raw) || raw.length === 0) {
-      failCommitment("invalid_participant_identity", "participantIdentities must be a non-empty array when provided");
-    }
-    for (const item of raw) {
-      const spec: BallotParticipantIdentity =
-        typeof item === "string"
-          ? { slug: item }
-          : item && typeof item === "object"
-            ? item
-            : failCommitment("invalid_participant_identity", "participant identity must be a string or object");
-      const slug = (spec.slug ?? "").trim().toLowerCase();
-      if (!slug || CONTROL_OR_SEP.test(slug)) {
-        failCommitment("invalid_participant_identity", `invalid participant slug '${String(spec.slug)}'`);
-      }
-      if (!eligibleSet.has(slug)) {
-        failCommitment(
-          "ineligible_voter",
-          `participant '${slug}' is not in the eligible vote set`,
-        );
-      }
-      if (bySlug.has(slug)) {
-        failCommitment("invalid_participant_identity", `duplicate participant identity for '${slug}'`);
-      }
-      const address = spec.address !== undefined ? spec.address.trim() : undefined;
-      if (address !== undefined && (!address || CONTROL_OR_SEP.test(address))) {
-        failCommitment("invalid_participant_identity", `invalid participant address for '${slug}'`);
-      }
-      const track = spec.track;
-      if (track !== undefined && track !== "classic" && track !== "philosopher") {
-        failCommitment("invalid_participant_identity", `invalid participant track '${String(track)}' for '${slug}'`);
-      }
-      const entry: BallotParticipantIdentity = {
-        slug,
-        ...(address ? { address } : {}),
-        ...(track ? { track } : {}),
-      };
-      bySlug.set(slug, Object.freeze(entry));
-    }
-  } else {
-    // Derive canonical participant identities from the eligible vote set + any vote addresses.
-    const voteAddresses = new Map<string, string>();
-    for (const v of votes) {
-      if (v.disposition === "valid" && v.participantAddress) {
-        const slug = v.slug.trim().toLowerCase();
-        const addr = v.participantAddress.trim();
-        if (CONTROL_OR_SEP.test(addr)) {
-          failCommitment("invalid_participant_identity", `invalid participantAddress on vote for '${slug}'`);
-        }
-        if (!voteAddresses.has(slug)) {
-          voteAddresses.set(slug, addr);
-        }
-      }
-    }
-    for (const slug of eligibleVoteSet) {
-      const address = voteAddresses.get(slug);
-      bySlug.set(
-        slug,
-        Object.freeze({
-          slug,
-          ...(address ? { address } : {}),
-        }),
-      );
-    }
-  }
-
-  return [...bySlug.values()].sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-function serializeParticipant(p: BallotParticipantIdentity): string {
-  return `${p.slug}@${p.address ?? ""}:${p.track ?? ""}`;
-}
-
-function serializeCommittedVote(v: CommittedBallotVote): string {
-  return [
-    v.slug,
-    v.participantAddress ?? "",
-    v.verdict,
-    String(v.confidence),
-    v.decisive ? "1" : "0",
-    v.recordedAtMs !== undefined ? String(v.recordedAtMs) : "",
-  ].join("|");
-}
-
-/**
- * Deterministic canonical payload for a versioned council ballot commitment.
- */
-export function canonicalBallotCommitmentPayload(
-  commitment: Omit<CouncilBallotCommitment, "commitmentHash" | "digest">,
-): string {
-  const lines = [
-    "mimir-council-ballot-commitment",
-    `version:${commitment.version}`,
-    `claim:${commitment.claimId}`,
-    `revision:${commitment.claimRevision}`,
-    `boundary:${commitment.votingBoundaryMs === null ? "none" : commitment.votingBoundaryMs}`,
-    `eligible:${commitment.eligibleVoteSet.join(",")}`,
-    `participants:${commitment.participantIdentities.map(serializeParticipant).join(",")}`,
-    `ballot:${commitment.ballot.length}`,
-    ...commitment.ballot.map(serializeCommittedVote),
-  ];
-  return lines.join("\n");
-}
-
-function computeCommitmentDigest(
-  commitment: Omit<CouncilBallotCommitment, "commitmentHash" | "digest">,
-): string {
-  return createHash("sha256")
-    .update(canonicalBallotCommitmentPayload(commitment), "utf8")
-    .digest("hex");
-}
-
-/**
- * Create a versioned council ballot commitment before outcome evaluation.
- *
- * Binds:
- * - schema `version` ({@link COUNCIL_BALLOT_COMMITMENT_VERSION})
- * - `claimId` and `claimRevision`
- * - `eligibleVoteSet` (the approved eligible persona slugs)
- * - `participantIdentities` (persona slugs and optional wallet addresses / tracks)
- * - `votingBoundaryMs` (when provided) and the canonical `ballot` snapshot.
- *
- * Throws {@link BallotCommitmentError} if any input is malformed, if a voter is
- * outside the eligible vote set or mismatches its bound participant identity, or
- * if any vote was recorded or altered after `votingBoundaryMs`.
- */
-export function createBallotCommitment(input: BallotCommitmentInput): CouncilBallotCommitment {
-  const version = input.version ?? COUNCIL_BALLOT_COMMITMENT_VERSION;
-  if (
-    typeof version !== "number" ||
-    !Number.isInteger(version) ||
-    version !== COUNCIL_BALLOT_COMMITMENT_VERSION
-  ) {
-    failCommitment(
-      "invalid_version",
-      `unsupported council ballot commitment version: ${String(version)}`,
-    );
-  }
-
-  if (!Number.isInteger(input.claimId) || input.claimId < 1) {
-    failCommitment("invalid_claim_id", `claimId must be a positive integer, got ${String(input.claimId)}`);
-  }
-
-  const claimRevision = normalizeRevisionString(input.claimRevision);
-  if (!claimRevision) {
-    failCommitment(
-      "invalid_claim_revision",
-      `claimRevision must be a non-empty string or non-negative integer, got ${String(input.claimRevision)}`,
-    );
-  }
-
-  let votingBoundaryMs: number | null = null;
-  if (input.votingBoundaryMs !== undefined && input.votingBoundaryMs !== null) {
-    if (
-      typeof input.votingBoundaryMs !== "number" ||
-      !Number.isFinite(input.votingBoundaryMs) ||
-      !Number.isInteger(input.votingBoundaryMs) ||
-      input.votingBoundaryMs < 0
-    ) {
-      failCommitment(
-        "invalid_voting_boundary",
-        `votingBoundaryMs must be a non-negative integer epoch ms, got ${String(input.votingBoundaryMs)}`,
-      );
-    }
-    votingBoundaryMs = input.votingBoundaryMs;
-  }
-
-  const rawVotes = input.votes ?? input.ballot ?? [];
-  if (!Array.isArray(rawVotes)) {
-    failCommitment("ballot_altered", "votes must be an array");
-  }
-
-  const eligibleVoteSet = normalizeEligibleVoteSet(input.eligibleVoteSet ?? input.eligibleSlugs);
-  const eligibleSet = new Set(eligibleVoteSet);
-  const participantIdentities = normalizeParticipantIdentities(
-    input.participantIdentities ?? input.participants,
-    eligibleVoteSet,
-    rawVotes,
-  );
-  const participantBySlug = new Map(participantIdentities.map((p) => [p.slug, p]));
-
-  // Pre-check all attempts for post-boundary alteration or ineligible valid votes
-  // before folding duplicates, so boundary violations never slip through silently.
-  for (const attempt of rawVotes) {
-    if (!attempt || typeof attempt !== "object") {
-      failCommitment("ballot_altered", "malformed vote entry in ballot");
-    }
-    const slug = (attempt.slug ?? "").trim().toLowerCase();
-    if (votingBoundaryMs !== null) {
-      if (
-        attempt.alteredAtMs !== undefined &&
-        (!Number.isFinite(attempt.alteredAtMs) || attempt.alteredAtMs > votingBoundaryMs)
-      ) {
-        failCommitment(
-          "altered_after_boundary",
-          `vote for '${slug || "unknown"}' was altered at ${String(attempt.alteredAtMs)}ms after approved voting boundary ${votingBoundaryMs}ms`,
-        );
-      }
-      if (
-        attempt.recordedAtMs !== undefined &&
-        (!Number.isFinite(attempt.recordedAtMs) || attempt.recordedAtMs > votingBoundaryMs)
-      ) {
-        failCommitment(
-          "recorded_after_boundary",
-          `vote for '${slug || "unknown"}' was recorded at ${String(attempt.recordedAtMs)}ms after approved voting boundary ${votingBoundaryMs}ms`,
-        );
-      }
-    }
-    if (attempt.claimRevision !== undefined) {
-      const attemptRev = normalizeRevisionString(attempt.claimRevision);
-      if (!attemptRev || attemptRev !== claimRevision) {
-        failCommitment(
-          "claim_revision_mismatch",
-          `vote for '${slug || "unknown"}' targets claimRevision '${String(attempt.claimRevision)}', expected '${claimRevision}'`,
-        );
-      }
-    }
-    if (attempt.disposition === "valid") {
-      if (!slug || !eligibleSet.has(slug)) {
-        failCommitment(
-          "ineligible_voter",
-          `voter '${slug}' is not in the committed eligible vote set`,
-        );
-      }
-      const boundParticipant = participantBySlug.get(slug);
-      if (!boundParticipant) {
-        failCommitment(
-          "participant_identity_mismatch",
-          `voter '${slug}' has no bound participant identity`,
-        );
-      }
-      if (attempt.participantAddress !== undefined) {
-        const addr = attempt.participantAddress.trim();
-        if (!addr || CONTROL_OR_SEP.test(addr)) {
-          failCommitment("invalid_participant_identity", `invalid participantAddress for '${slug}'`);
-        }
-        if (boundParticipant.address && boundParticipant.address !== addr) {
-          failCommitment(
-            "participant_identity_mismatch",
-            `voter '${slug}' participantAddress '${addr}' does not match bound address '${boundParticipant.address}'`,
-          );
-        }
-      }
-    }
-  }
-
-  const { ballot: folded } = buildBallot([...rawVotes]);
-  const committedBallot: CommittedBallotVote[] = folded.map((vote) => {
-    const slug = vote.slug.trim().toLowerCase();
-    if (!vote.verdict || !isVerdict(vote.verdict)) {
-      failCommitment("ballot_altered", `valid ballot vote for '${slug}' is missing a valid verdict`);
-    }
-    const confidence = clampConfidence(vote.confidence);
-    const decisive = isDecisiveVerdict(vote.verdict);
-    if (vote.decisive !== decisive) {
-      failCommitment("ballot_altered", `ballot vote for '${slug}' has inconsistent decisive flag`);
-    }
-    const bound = participantBySlug.get(slug);
-    const participantAddress = vote.participantAddress?.trim() || bound?.address;
-    const item: CommittedBallotVote = {
-      slug,
-      ...(participantAddress ? { participantAddress } : {}),
-      verdict: vote.verdict,
-      confidence,
-      decisive,
-      ...(vote.recordedAtMs !== undefined ? { recordedAtMs: vote.recordedAtMs } : {}),
-    };
-    return Object.freeze(item);
-  });
-
-  const unsigned = {
-    version,
-    claimId: input.claimId,
-    claimRevision,
-    votingBoundaryMs,
-    eligibleVoteSet: Object.freeze([...eligibleVoteSet]),
-    participantIdentities: Object.freeze([...participantIdentities]),
-    ballot: Object.freeze(committedBallot),
-  };
-
-  const commitmentHash = computeCommitmentDigest(unsigned);
-
-  return Object.freeze({
-    ...unsigned,
-    commitmentHash,
-    digest: commitmentHash,
-  });
-}
-
-/** Alias for {@link createBallotCommitment}. */
-export const commitCouncilBallot = createBallotCommitment;
-
-/**
- * Verify a candidate ballot and evaluation context against a versioned council
- * ballot commitment before outcome evaluation.
- *
- * Rejects any ballot altered after the approved voting boundary, any claim
- * revision or eligible vote set drift, any participant identity mismatch, and
- * any version or SHA-256 digest mismatch.
- */
-export function verifyBallotCommitment(
-  commitment: CouncilBallotCommitment | null | undefined,
-  attempts: readonly ClassifiedVote[],
-  context?: BallotCommitmentVerifyContext,
-): BallotCommitmentVerification {
-  if (!commitment || typeof commitment !== "object") {
-    return {
-      ok: false,
-      reason: "ballot_altered",
-      detail: "missing council ballot commitment",
-    };
-  }
-
-  if (
-    typeof commitment.version !== "number" ||
-    !Number.isInteger(commitment.version) ||
-    commitment.version !== COUNCIL_BALLOT_COMMITMENT_VERSION
-  ) {
-    return {
-      ok: false,
-      reason: "invalid_version",
-      detail: `unsupported ballot commitment version ${String(commitment.version)} (expected ${COUNCIL_BALLOT_COMMITMENT_VERSION})`,
-    };
-  }
-
-  if (!Number.isInteger(commitment.claimId) || commitment.claimId < 1) {
-    return {
-      ok: false,
-      reason: "invalid_claim_id",
-      detail: `invalid committed claimId ${String(commitment.claimId)}`,
-    };
-  }
-
-  if (context?.claimId !== undefined && context.claimId !== commitment.claimId) {
-    return {
-      ok: false,
-      reason: "invalid_claim_id",
-      detail: `evaluation claimId ${context.claimId} does not match committed claimId ${commitment.claimId}`,
-    };
-  }
-
-  const committedRevision = normalizeRevisionString(commitment.claimRevision);
-  if (!committedRevision) {
-    return {
-      ok: false,
-      reason: "invalid_claim_revision",
-      detail: "committed claimRevision is empty or invalid",
-    };
-  }
-
-  if (context?.claimRevision !== undefined) {
-    const contextRevision = normalizeRevisionString(context.claimRevision);
-    if (!contextRevision || contextRevision !== committedRevision) {
-      return {
-        ok: false,
-        reason: "claim_revision_mismatch",
-        detail: `evaluation claimRevision '${String(context.claimRevision)}' does not match committed revision '${committedRevision}'`,
-      };
-    }
-  }
-
-  if (
-    commitment.votingBoundaryMs !== null &&
-    (typeof commitment.votingBoundaryMs !== "number" ||
-      !Number.isFinite(commitment.votingBoundaryMs) ||
-      !Number.isInteger(commitment.votingBoundaryMs) ||
-      commitment.votingBoundaryMs < 0)
-  ) {
-    return {
-      ok: false,
-      reason: "invalid_voting_boundary",
-      detail: `invalid committed votingBoundaryMs ${String(commitment.votingBoundaryMs)}`,
-    };
-  }
-
-  if (
-    context?.votingBoundaryMs !== undefined &&
-    context.votingBoundaryMs !== null &&
-    commitment.votingBoundaryMs !== null &&
-    context.votingBoundaryMs !== commitment.votingBoundaryMs
-  ) {
-    return {
-      ok: false,
-      reason: "invalid_voting_boundary",
-      detail: `evaluation votingBoundaryMs ${context.votingBoundaryMs} does not match committed boundary ${commitment.votingBoundaryMs}`,
-    };
-  }
-
-  const effectiveBoundaryMs =
-    commitment.votingBoundaryMs ??
-    (context?.votingBoundaryMs !== undefined && context.votingBoundaryMs !== null
-      ? context.votingBoundaryMs
-      : null);
-
-  let committedEligible: string[];
-  try {
-    committedEligible = normalizeEligibleVoteSet(commitment.eligibleVoteSet);
-  } catch (err) {
-    return {
-      ok: false,
-      reason: err instanceof BallotCommitmentError ? err.reason : "invalid_eligible_vote_set",
-      detail: err instanceof Error ? err.message : "invalid committed eligibleVoteSet",
-    };
-  }
-
-  if (
-    committedEligible.length !== commitment.eligibleVoteSet.length ||
-    committedEligible.some((slug, idx) => slug !== commitment.eligibleVoteSet[idx])
-  ) {
-    return {
-      ok: false,
-      reason: "eligible_vote_set_mismatch",
-      detail: "committed eligibleVoteSet is not in canonical form",
-    };
-  }
-
-  if (context?.eligibleVoteSet !== undefined) {
-    let contextEligible: string[];
-    try {
-      contextEligible = normalizeEligibleVoteSet(context.eligibleVoteSet);
-    } catch (err) {
-      return {
-        ok: false,
-        reason: err instanceof BallotCommitmentError ? err.reason : "invalid_eligible_vote_set",
-        detail: err instanceof Error ? err.message : "invalid context eligibleVoteSet",
-      };
-    }
-    if (
-      contextEligible.length !== committedEligible.length ||
-      contextEligible.some((slug, idx) => slug !== committedEligible[idx])
-    ) {
-      return {
-        ok: false,
-        reason: "eligible_vote_set_mismatch",
-        detail: `eligible vote set [${contextEligible.join(",")}] does not match committed set [${committedEligible.join(",")}]`,
-      };
-    }
-  }
-
-  let committedParticipants: BallotParticipantIdentity[];
-  try {
-    committedParticipants = normalizeParticipantIdentities(
-      commitment.participantIdentities,
-      committedEligible,
-      [],
-    );
-  } catch (err) {
-    return {
-      ok: false,
-      reason: err instanceof BallotCommitmentError ? err.reason : "invalid_participant_identity",
-      detail: err instanceof Error ? err.message : "invalid committed participantIdentities",
-    };
-  }
-
-  if (
-    committedParticipants.length !== commitment.participantIdentities.length ||
-    committedParticipants.some(
-      (p, idx) =>
-        serializeParticipant(p) !== serializeParticipant(commitment.participantIdentities[idx]!),
-    )
-  ) {
-    return {
-      ok: false,
-      reason: "participant_identity_mismatch",
-      detail: "committed participantIdentities were altered or out of canonical order",
-    };
-  }
-
-  if (context?.participantIdentities !== undefined) {
-    let contextParticipants: BallotParticipantIdentity[];
-    try {
-      contextParticipants = normalizeParticipantIdentities(
-        context.participantIdentities,
-        committedEligible,
-        [],
-      );
-    } catch (err) {
-      return {
-        ok: false,
-        reason: err instanceof BallotCommitmentError ? err.reason : "invalid_participant_identity",
-        detail: err instanceof Error ? err.message : "invalid context participantIdentities",
-      };
-    }
-    if (
-      contextParticipants.length !== committedParticipants.length ||
-      contextParticipants.some(
-        (p, idx) => serializeParticipant(p) !== serializeParticipant(committedParticipants[idx]!),
-      )
-    ) {
-      return {
-        ok: false,
-        reason: "participant_identity_mismatch",
-        detail: "evaluation participantIdentities do not match committed participant identities",
-      };
-    }
-  }
-
-  // Recompute digest over the commitment object itself to detect any tampering with commitment fields.
-  const expectedHash = computeCommitmentDigest({
-    version: commitment.version,
-    claimId: commitment.claimId,
-    claimRevision: committedRevision,
-    votingBoundaryMs: commitment.votingBoundaryMs,
-    eligibleVoteSet: commitment.eligibleVoteSet,
-    participantIdentities: commitment.participantIdentities,
-    ballot: commitment.ballot,
-  });
-
-  const providedHash = (commitment.commitmentHash ?? commitment.digest ?? "").trim().toLowerCase();
-  if (
-    !providedHash ||
-    providedHash !== expectedHash ||
-    (commitment.digest !== undefined && commitment.digest.trim().toLowerCase() !== expectedHash)
-  ) {
-    return {
-      ok: false,
-      reason: "digest_mismatch",
-      detail: "ballot commitment hash does not match canonical commitment payload",
-      commitmentHash: providedHash,
-      expectedHash,
-    };
-  }
-
-  const eligibleSet = new Set(committedEligible);
-  const participantBySlug = new Map(committedParticipants.map((p) => [p.slug, p]));
-
-  // Inspect every attempt for post-boundary edits, revision drift, or ineligible voters.
-  for (const attempt of attempts) {
-    const slug = (attempt.slug ?? "").trim().toLowerCase();
-    if (effectiveBoundaryMs !== null) {
-      if (
-        attempt.alteredAtMs !== undefined &&
-        (!Number.isFinite(attempt.alteredAtMs) || attempt.alteredAtMs > effectiveBoundaryMs)
-      ) {
-        return {
-          ok: false,
-          reason: "altered_after_boundary",
-          detail: `ballot vote for '${slug || "unknown"}' was altered at ${String(attempt.alteredAtMs)}ms after approved voting boundary ${effectiveBoundaryMs}ms`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-      if (
-        attempt.recordedAtMs !== undefined &&
-        (!Number.isFinite(attempt.recordedAtMs) || attempt.recordedAtMs > effectiveBoundaryMs)
-      ) {
-        return {
-          ok: false,
-          reason: "recorded_after_boundary",
-          detail: `ballot vote for '${slug || "unknown"}' was recorded at ${String(attempt.recordedAtMs)}ms after approved voting boundary ${effectiveBoundaryMs}ms`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-    }
-    if (attempt.claimRevision !== undefined) {
-      const attemptRev = normalizeRevisionString(attempt.claimRevision);
-      if (!attemptRev || attemptRev !== committedRevision) {
-        return {
-          ok: false,
-          reason: "claim_revision_mismatch",
-          detail: `ballot vote for '${slug || "unknown"}' carries claimRevision '${String(attempt.claimRevision)}', expected '${committedRevision}'`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-    }
-    if (attempt.disposition === "valid") {
-      if (!slug || !eligibleSet.has(slug)) {
-        return {
-          ok: false,
-          reason: "ineligible_voter",
-          detail: `ballot vote from '${slug}' is not in the committed eligible vote set`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-      const bound = participantBySlug.get(slug);
-      if (!bound) {
-        return {
-          ok: false,
-          reason: "participant_identity_mismatch",
-          detail: `ballot vote from '${slug}' is missing a committed participant identity`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-      if (
-        bound.address &&
-        attempt.participantAddress !== undefined &&
-        attempt.participantAddress.trim() !== bound.address
-      ) {
-        return {
-          ok: false,
-          reason: "participant_identity_mismatch",
-          detail: `ballot vote from '${slug}' has participantAddress '${attempt.participantAddress.trim()}', expected '${bound.address}'`,
-          commitmentHash: providedHash,
-          expectedHash,
-        };
-      }
-    }
-  }
-
-  // Compare folded valid ballot against committed ballot snapshot.
-  const { ballot: candidateBallot } = buildBallot([...attempts]);
-  if (candidateBallot.length !== commitment.ballot.length) {
-    return {
-      ok: false,
-      reason: "altered_after_boundary",
-      detail: `ballot vote count (${candidateBallot.length}) differs from committed ballot (${commitment.ballot.length}) after voting boundary`,
-      commitmentHash: providedHash,
-      expectedHash,
-    };
-  }
-
-  for (let i = 0; i < commitment.ballot.length; i += 1) {
-    const committedVote = commitment.ballot[i]!;
-    const actualVote = candidateBallot[i]!;
-    const actualSlug = actualVote.slug.trim().toLowerCase();
-    const bound = participantBySlug.get(actualSlug);
-    const actualAddress = actualVote.participantAddress?.trim() || bound?.address;
-    const actualConfidence = clampConfidence(actualVote.confidence);
-
-    if (actualSlug !== committedVote.slug) {
-      return {
-        ok: false,
-        reason: "altered_after_boundary",
-        detail: `ballot order or voter at position ${i} changed from '${committedVote.slug}' to '${actualSlug}' after voting boundary`,
-        commitmentHash: providedHash,
-        expectedHash,
-      };
-    }
-    if ((actualAddress ?? undefined) !== (committedVote.participantAddress ?? undefined)) {
-      return {
-        ok: false,
-        reason: "participant_identity_mismatch",
-        detail: `participant address for '${actualSlug}' changed after voting boundary`,
-        commitmentHash: providedHash,
-        expectedHash,
-      };
-    }
-    if (
-      actualVote.verdict !== committedVote.verdict ||
-      actualConfidence !== committedVote.confidence ||
-      actualVote.decisive !== committedVote.decisive
-    ) {
-      return {
-        ok: false,
-        reason: "altered_after_boundary",
-        detail: `ballot vote for '${actualSlug}' was altered after approved voting boundary`,
-        commitmentHash: providedHash,
-        expectedHash,
-      };
-    }
-    if (
-      committedVote.recordedAtMs !== undefined &&
-      actualVote.recordedAtMs !== committedVote.recordedAtMs
-    ) {
-      return {
-        ok: false,
-        reason: "altered_after_boundary",
-        detail: `recordedAtMs for '${actualSlug}' changed after approved voting boundary`,
-        commitmentHash: providedHash,
-        expectedHash,
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    detail: "ballot commitment verified",
-    commitmentHash: expectedHash,
-    expectedHash,
-  };
+export interface QuorumEvaluationOptions extends BuildBallotOptions {
+  claimState?: ClaimSettleState;
+  strictConfig?: boolean;
+  /** True when the ballot or settlement period has expired. */
+  ballotExpired?: boolean;
+  /** Age of the ballot in ms. */
+  ballotAgeMs?: number;
+  /** Max allowed age for a ballot in ms before it is considered expired. */
+  maxBallotAgeMs?: number;
+  /** Timestamp in ms after which the ballot is expired. */
+  ballotDeadlineMs?: number;
+  /** Reference timestamp in ms (defaults to Date.now()). */
+  nowMs?: number;
 }
 
 /**
@@ -1366,6 +772,28 @@ export function evaluateQuorum(
     };
   }
 
+  const isExpired =
+    claimState === "expired" ||
+    opts?.ballotExpired === true ||
+    (opts?.maxBallotAgeMs != null &&
+      opts?.ballotAgeMs != null &&
+      opts.ballotAgeMs > opts.maxBallotAgeMs) ||
+    (opts?.ballotDeadlineMs != null &&
+      (opts.nowMs ?? Date.now()) > opts.ballotDeadlineMs);
+
+  if (isExpired) {
+    return {
+      action: "abort_expired",
+      quorum: normalizeQuorum(quorumRaw),
+      decisiveCount: 0,
+      acceptedCount: 0,
+      dispositions: countDispositions(attempts),
+      reason: "ballot expired — council settlement aborted",
+      acceptedSlugs: [],
+      ballot: [],
+    };
+  }
+
   if (opts?.strictConfig && isInvalidQuorumConfig(quorumRaw)) {
     return {
       action: "abort_invalid_config",
@@ -1418,6 +846,22 @@ export function evaluateQuorum(
     dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
     paused ? `${paused} paused` : null,
     dep ? `${dep} dependency_failure` : null,
+  ].filter(Boolean);
+
+  const dep = dispositions.dependency_failure;
+  const paused = dispositions.paused;
+  const equiv = dispositions.equivocation;
+  const expired = dispositions.expired;
+  const reasonParts = [
+    `below quorum: ${decisiveCount} decisive < ${quorum}`,
+    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
+    dispositions.stale ? `${dispositions.stale} stale` : null,
+    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
+    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
+    paused ? `${paused} paused` : null,
+    dep ? `${dep} dependency_failure` : null,
+    equiv ? `${equiv} equivocation` : null,
+    expired ? `${expired} expired` : null,
   ].filter(Boolean);
 
   return {
