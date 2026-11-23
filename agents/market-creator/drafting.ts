@@ -12,10 +12,11 @@
 import * as crypto from "node:crypto";
 import { extractUsdThresholds, cryptoThresholdReason } from "./thresholds.js";
 import {
-  canonicaliseResolutionSourceUrl,
-  canonicaliseStatementDeadline,
-  filterDuplicateCandidates,
-  hasInvalidTextEncoding,
+  computeStatementDigest,
+  buildDeduplicationIdentity,
+  reconcileSubmission,
+  type MarketCreationIntent,
+  type ReconciliationResult,
 } from "./dedupe.js";
 
 export interface ClaimCandidate {
@@ -29,10 +30,12 @@ export interface ClaimCandidate {
   deadlineInterpretation?: DeadlineInterpretation;
   category?: string;
   threshold?: number;
-  /** Source snapshot identity the candidate was drafted from. */
-  sourceId?: string;
-  /** Capture version of the source snapshot the candidate was drafted from. */
-  captureVersion?: string;
+  statementDigest?: string;
+  deduplicationId?: string;
+  creatorPosition?: string;
+  counterPosition?: string;
+  settlementRule?: string;
+  qualityScore?: number;
   [key: string]: unknown;
 }
 
@@ -1097,16 +1100,9 @@ export function parseDraftedCandidates(raw: string): ClaimCandidate[] {
     const rec = item as Record<string, unknown>;
     const question = typeof rec.question === "string" ? rec.question.trim() : "";
     const resolutionUrl = typeof rec.resolutionUrl === "string" ? rec.resolutionUrl.trim() : "";
-    const rawDeadline = typeof rec.deadline === "string" ? rec.deadline.trim() : "";
-    if (!question || !resolutionUrl || !rawDeadline) continue;
-
-    const zoneField = extractCandidateZoneField(rec);
-    if (!zoneField.ok) continue;
-
-    const interpreted = interpretDeadline(rawDeadline, zoneField.zone);
-    if (!interpreted) continue;
-
-    out.push({
+    const deadline = typeof rec.deadline === "string" ? rec.deadline.trim() : "";
+    if (!question || !resolutionUrl || !deadline) continue;
+    const candidate: ClaimCandidate = {
       question,
       resolutionUrl,
       deadline: interpreted.canonicalUtc,
@@ -1114,7 +1110,14 @@ export function parseDraftedCandidates(raw: string): ClaimCandidate[] {
       deadlineInterpretation: interpreted,
       category: typeof rec.category === "string" ? rec.category : undefined,
       threshold: typeof rec.threshold === "number" ? rec.threshold : undefined,
-    });
+      creatorPosition: typeof rec.creatorPosition === "string" ? rec.creatorPosition : undefined,
+      counterPosition: typeof rec.counterPosition === "string" ? rec.counterPosition : undefined,
+      settlementRule: typeof rec.settlementRule === "string" ? rec.settlementRule : undefined,
+      qualityScore: typeof rec.qualityScore === "number" ? rec.qualityScore : undefined,
+    };
+    candidate.statementDigest = computeStatementDigest(candidate);
+    candidate.deduplicationId = buildDeduplicationIdentity(candidate);
+    out.push(candidate);
   }
   return out;
 }
@@ -1130,6 +1133,33 @@ export function filterUnsafeCryptoThresholds(
     if (candidate.threshold === undefined) return true;
     return cryptoThresholdReason(candidate.threshold) === null;
   });
+}
+
+/**
+ * Create a durable market creation intent from a drafted candidate.
+ */
+export function createMarketCreationIntent(
+  candidate: ClaimCandidate,
+  options?: { qualityScore?: number; status?: MarketCreationIntent["status"] },
+): MarketCreationIntent {
+  const statementDigest = computeStatementDigest(candidate);
+  const id = buildDeduplicationIdentity(candidate);
+  const now = Date.now();
+  return {
+    id,
+    statementDigest,
+    question: candidate.question,
+    resolutionUrl: candidate.resolutionUrl,
+    deadline: candidate.deadline,
+    category: candidate.category,
+    creatorPosition: candidate.creatorPosition,
+    counterPosition: candidate.counterPosition,
+    settlementRule: candidate.settlementRule,
+    qualityScore: options?.qualityScore ?? candidate.qualityScore,
+    status: options?.status ?? "draft",
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 /**
@@ -1167,4 +1197,12 @@ export async function draftClaimCandidatesWithRetry(
  * Exported for tests and for callers that want to inspect threshold
  * mentions in a drafted question without running the full filter.
  */
-export { extractUsdThresholds, cryptoThresholdReason };
+export {
+  extractUsdThresholds,
+  cryptoThresholdReason,
+  computeStatementDigest,
+  buildDeduplicationIdentity,
+  reconcileSubmission,
+  type MarketCreationIntent,
+  type ReconciliationResult,
+};
