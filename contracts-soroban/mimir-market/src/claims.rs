@@ -107,16 +107,6 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
     storage::set_claim(env, id, &claim);
     storage::set_challengers(env, id, &Vec::new(env));
     storage::append_creator_claim(env, &creator, id);
-    claim_history::record(
-        env,
-        id,
-        TransitionKind::Created,
-        ClaimState::Open,
-        ClaimState::Open,
-        Some(creator.clone()),
-        params.stake_amount,
-        WinnerSide::None,
-    )?;
 
     events::EscrowSeeded {
         id,
@@ -543,45 +533,39 @@ pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
         return Err(Error::ClaimNotOpen);
     }
 
-    // Cancellation is the one lifecycle transition where the creator, not the
-    // oracle, moves money out of escrow. The state check above is what every
-    // caller knows; the checks below are what the CONTRACT knows. They guard
-    // against the two ways a refund could diverge from the escrow the claim
-    // actually holds, whatever the caller believes.
-    //
-    // 1) A claim that already accepted challengers is no longer a refund:
-    //    the creator cannot unilaterally pull out while counterparty money
-    //    is locked. That would break conservation and cheat challengers.
-    // 2) The refund must never exceed the creator stake the claim actually
-    //    holds; the conservation invariant is the authority for this.
-    if claim.challenger_count > 0
-        || claim.total_challenger_stake > 0
-        || claim.reserved_creator_liability > 0
+    if claim.challenger_count != 0
+        || claim.total_challenger_stake != 0
+        || claim.reserved_creator_liability != 0
     {
+        events::CancellationRefused {
+            id: claim_id,
+            challenger_count: claim.challenger_count,
+            total_challenger_stake: claim.total_challenger_stake,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            reason: Error::ClaimHasActiveClaims as u32,
+        }
+        .publish(env);
         return Err(Error::ClaimHasActiveClaims);
     }
-    util::assert_claim_conservation(&claim)?;
 
-    let creator = claim.creator.clone();
     let refund = claim.creator_stake;
+    let usdc = storage::usdc(env)?;
+    if escrow::balance(env, &usdc) < refund {
+        events::CancellationRefused {
+            id: claim_id,
+            challenger_count: claim.challenger_count,
+            total_challenger_stake: claim.total_challenger_stake,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            reason: Error::RefundNotEscrowed as u32,
+        }
+        .publish(env);
+        return Err(Error::RefundNotEscrowed);
+    }
+
     claim.state = ClaimState::Cancelled;
-    claim.remaining_escrow = 0;
+    let creator = claim.creator.clone();
     storage::set_claim(env, claim_id, &claim);
 
-    events::ClaimStateTransitioned {
-        id: claim_id,
-        from_state: ClaimState::Open as u32,
-        to_state: ClaimState::Cancelled as u32,
-        timestamp: env.ledger().timestamp(),
-    }
-    .publish(env);
-
-    // Refunds are always allowed, even when the contract is paused: pause
-    // controls must never block withdrawals or refunds of already-committed
-    // funds. The check is done here (not in escrow), so the pause flag is
-    // explicit at the call site and testable independently of escrow.
-    // NOTE: this function is deliberately NOT gated on the pause flag.
-    let usdc = storage::usdc(env)?;
     let pending_before = storage::withdrawable(env, &creator);
     escrow::push_or_park(env, &usdc, &creator, refund);
 

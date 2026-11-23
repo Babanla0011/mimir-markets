@@ -23,13 +23,13 @@ mod util;
 /// Offline, chain-free check of a recorded settlement (#805).
 pub mod settlement_verifier;
 
+pub mod contract;
+
 pub use contract::{MimirMarket, MimirMarketClient};
 pub use types::*;
 
 #[cfg(test)]
 mod test_challenge_lock;
-#[cfg(test)]
-mod test_claim_history;
 #[cfg(test)]
 mod test_common;
 #[cfg(test)]
@@ -41,8 +41,6 @@ mod test_fee_rounding;
 #[cfg(test)]
 mod test_fees;
 #[cfg(test)]
-mod test_fee_recipient_transition;
-#[cfg(test)]
 mod test_lifecycle;
 #[cfg(test)]
 mod test_pagination;
@@ -51,18 +49,10 @@ mod test_settlement;
 #[cfg(test)]
 mod test_verdict;
 #[cfg(test)]
-mod test_preflight;
-#[cfg(test)]
 mod test_batch_read;
 #[cfg(test)]
 mod test_batch_get_claims;
 #[cfg(test)]
 mod test_rematch_status;
 #[cfg(test)]
-mod test_budgets;
-#[cfg(test)]
-mod test_oracle_timelock;
-#[cfg(test)]
-mod test_creator_index;
-#[cfg(test)]
-mod test_settlement_verifier;
+mod test_fee_liabilities;

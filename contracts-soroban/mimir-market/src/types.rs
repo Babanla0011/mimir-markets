@@ -247,47 +247,41 @@ pub struct FeeSnapshot {
     pub agent_owner_recipient: Option<Address>,
 }
 
-/// Current schema version returned by `get_fee_policy_compatibility`.
-pub const FEE_POLICY_COMPAT_VERSION: u32 = 1;
+// ── Fee liability summary ────────────────────────────────────────────────────
 
-/// Hard upper bound on the number of field identifiers returned in
-/// `FeePolicyCompatibility::supported_fields`.
-pub const FEE_POLICY_COMPAT_MAX_FIELDS: u32 = 5;
-
-/// Rounding semantics applied by `fees::quote_fees` and `fees::apply_fees`.
+/// Known recipient class for fee liabilities.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FeeRoundingMode {
-    /// Each fee leg is `floor(profit * bps / BPS_DIVISOR)` computed
-    /// independently; the fractional remainder stays with the participant
-    /// (`owed = gross - fees_taken`), so principal is never reduced and fee
-    /// rounding leaves no dust in escrow.
-    FloorPerLegParticipantRemainder = 0,
+#[repr(u32)]
+pub enum FeeRecipientClass {
+    Platform = 1,
+    AgentOwner = 2,
 }
 
-/// Bounded fee-policy compatibility descriptor for generated clients.
-///
-/// Returned by `get_fee_policy_compatibility` in O(1) instance storage reads so
-/// generated clients and indexers can verify supported policy fields, hard
-/// caps, timelock, escrow scale, rounding semantics, and live/pending policy
-/// revision without mutating state.
+/// Liability status for a specific recipient class.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeePolicyCompatibility {
-    pub schema_version: u32,
-    pub supported_fields: Vec<Symbol>,
-    pub max_total_fee_bps: u32,
-    pub bps_divisor: i128,
-    pub fee_timelock_seconds: u64,
-    pub usdc_decimals: u32,
-    pub min_stake: i128,
-    pub rounding_mode: FeeRoundingMode,
-    pub profit_only: bool,
-    pub pull_based_payouts: bool,
-    pub exact_usdc_escrow: bool,
-    pub current_revision: u64,
-    pub current_total_fee_bps: u32,
-    pub has_pending_policy: bool,
+pub struct FeeClassLiability {
+    pub recipient_class: FeeRecipientClass,
+    pub accrued: i128,
+    pub claimed: i128,
+    pub collectible: i128,
+}
+
+/// Aggregate summary of fee liabilities across all markets, partitioned by
+/// known recipient class and strictly separated from user principal in custody.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeLiabilitySummary {
+    pub platform_accrued: i128,
+    pub platform_claimed: i128,
+    pub platform_collectible: i128,
+    pub agent_owner_accrued: i128,
+    pub agent_owner_claimed: i128,
+    pub agent_owner_collectible: i128,
+    pub total_collectible_fees: i128,
+    pub user_principal: i128,
+    pub total_withdrawable: i128,
 }
 
 // ── Claim ────────────────────────────────────────────────────────────────────
@@ -693,8 +687,5 @@ pub enum Error {
     /// in). The write is refused so the contract never records an impossible
     /// state.
     ConservationViolation = 47,
-    /// `get_claim_history` was asked for more than `MAX_HISTORY_PAGE_SIZE`
-    /// transitions in one page. Refused before any storage is read. (48 is
-    /// left to `StaleClaimRevision`, which docs/CONTRACT_ERRORS.md reserves.)
-    HistoryPageTooLarge = 49,
+    Paused = 48,
 }

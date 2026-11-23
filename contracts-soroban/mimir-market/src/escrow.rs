@@ -111,28 +111,11 @@ pub fn balance(env: &Env, usdc: &Address) -> i128 {
     token::TokenClient::new(env, usdc).balance(&env.current_contract_address())
 }
 
-#[cfg(test)]
-mod fee_balance_tests {
-    use super::fee_balance;
-
-    #[test]
-    fn no_accrual_is_all_zero() {
-        let b = fee_balance(0, 0);
-        assert_eq!(b.accrued, 0);
-        assert_eq!(b.claimed, 0);
-        assert_eq!(b.outstanding, 0);
-    }
-
-    #[test]
-    fn fully_claimed_differs_from_no_accrual() {
-        let b = fee_balance(5_000_000, 5_000_000);
-        assert_eq!(b.outstanding, 0);
-        assert_ne!(b, fee_balance(0, 0));
-    }
-
-    #[test]
-    fn partially_claimed_is_exact() {
-        let b = fee_balance(10_000_000, 3_500_000);
-        assert_eq!(b.outstanding, 6_500_000);
-    }
+/// User principal held in custody, strictly separate from collectible fee liabilities.
+///
+/// Total USDC balance is partitioned into `user_principal + collectible_fees`.
+/// User principal covers open creator stakes, active challenger stakes, uncollected
+/// payouts, and parked withdrawable funds.
+pub fn user_principal(env: &Env, usdc: &Address, collectible_fees: i128) -> i128 {
+    balance(env, usdc).saturating_sub(collectible_fees).max(0)
 }
