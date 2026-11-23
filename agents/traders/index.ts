@@ -392,15 +392,17 @@ async function runTrader(persona: TraderPersona): Promise<void> {
   const record = await ensureRegistered(persona, wallet);
   const todayStaked = sumTodayStake(await gatherWalletStakes(wallet), wallet.address);
   const maxDaily = record.limits.maxDailyExposureUsdc;
+  // Restart-safe: a claim this wallet already holds a stake on (confirmed or
+  // still-uncertain from a previous process) is never re-staked automatically.
+  const alreadyStaked = new Set((await gatherWalletStakes(wallet)).map((s) => s.claimId));
 
   const signalStore = getSignalStore();
   let staked = 0;
   let paidReads = 0;
   for (const claim of joinable) {
     if (staked >= MAX_STAKES_PER_CYCLE) break;
-    const signalId = buildSignalIdentity(persona.agentId, claim.id);
-    if (signalStore.isConsumed(signalId)) {
-      console.log(`[traders]   #${claim.id} signal ${signalId} already consumed — skipping quote purchase`);
+    if (alreadyStaked.has(claim.id)) {
+      console.log(`[traders]   skip #${claim.id}: existing stake from a prior run, not re-staking`);
       continue;
     }
     let secondOpinion: string | null = null;
