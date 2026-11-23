@@ -40,6 +40,14 @@ mod test_membership_cap;
 mod test_payouts;
 #[cfg(test)]
 mod test_cancellation;
+#[cfg(test)]
+mod test_lifecycle;
+#[cfg(test)]
+mod test_membership_cap;
+#[cfg(test)]
+mod test_payouts;
+#[cfg(test)]
+mod test_cancellation;
 #cfg(test)]
 mod test_conservation_random;
 #[cfg(test)]
