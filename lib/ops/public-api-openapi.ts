@@ -46,11 +46,7 @@ import {
   statusFor,
   type ApiErrorCode,
 } from "@/lib/api/errors";
-import {
-  CAPABILITIES_CACHE_CONTROL,
-  CAPABILITIES_ROUTE,
-  buildCapabilityDocument,
-} from "@/lib/api/capabilities";
+import { apiRecoveryActionSchema } from "@/lib/api/schema";
 import { TIER_POLICIES } from "@/lib/api/policy";
 import { DEFAULT_RULES } from "@/lib/api/rate-limit";
 import {
@@ -60,7 +56,7 @@ import {
   SUPPORTED_CAPABILITY_SCHEMA_VERSIONS,
 } from "@/lib/api/schema";
 import { DEFAULT_BASKET_POLICY } from "@/lib/baskets";
-import { getSeedChallengeOpportunities } from "@/lib/challengeOpportunitySeeds";
+import { getChallengeOpportunitySeeds } from "@/lib/challengeOpportunitySeeds";
 import {
   CLAIM_DRAFT_CATEGORY_IDS,
   CLAIM_DRAFT_SOURCE_TYPES,
@@ -258,6 +254,7 @@ export type PublicOpenApiFindingCode =
   | "DOC_PARAMETER_DRIFT"
   | "ERROR_STATUS_DRIFT"
   | "ERROR_RETRYABLE_DRIFT"
+  | "ERROR_RECOVERY_ACTION_DRIFT"
   | "EXAMPLE_MISSING"
   | "EXAMPLE_SCHEMA_REJECTED"
   | "EXAMPLE_VALIDATION_DRIFT"
@@ -502,6 +499,7 @@ export function buildPublicApiSchemas(): Record<string, Record<string, unknown>>
             type: "boolean",
             description: "Whether repeating the request after waiting or fixing freshness can succeed.",
           },
+          recoveryAction: apiRecoveryActionSchema(),
           retryAfterSeconds: {
             type: "number",
             minimum: 0,
@@ -818,6 +816,10 @@ export function buildPublicApiSchemas(): Record<string, Record<string, unknown>>
         additionalProperties: { type: ["integer", "null"], minimum: 0 },
       },
       workerTraceIds: {
+        type: "object",
+        additionalProperties: { type: ["string", "null"] },
+      },
+      workerDetails: {
         type: "object",
         additionalProperties: { type: ["string", "null"] },
       },
@@ -1374,7 +1376,7 @@ export function buildPublicEndpointExamples(): PublicEndpointExample[] {
   };
 
   // 5. /api/challenge-opportunities
-  const seed = getSeedChallengeOpportunities("en")[0]!;
+  const seed = getChallengeOpportunitySeeds("en")[0]!;
   const seedQuality = computeClaimQuality(
     {
       question: seed.candidate.claimText,
@@ -1631,6 +1633,18 @@ const GENERATED_HEADER = [
   "parameter, cache header, rate-limit rule, and example below is derived from",
   "the live route dependencies (lib/ops/public-api-openapi.ts) and verified",
   "against lib/ops/json-schema-subset.ts in tests/node/public-api-openapi.test.ts.",
+  "",
+  "Regenerate with `npm run check:schema-snapshot -- --write` after schema changes.",
+  "",
+  "Filter arrays (categories, states) are bounded before read-index queries are",
+  "constructed: at most 10 entries each, and at most 512 total bytes across all",
+  "entries. Violations return 400 `invalid_request` before any database work.",
+  "",
+  "CI note (browser-smoke): the TypeScript errors in tests/node/xmtp-chat-thread.test.ts",
+  "and tests/node/xmtp-optimistic-send.test.ts (missing `vitest` types, unresolved",
+  "`returnType`, implicit any parameters, and `ThreadDisplayRow` vs `Row` mismatches)",
+  "are not addressed by this generated contract file and must be fixed in those test",
+  "sources and their imports, without changing toolchain or dependency versions.",
 ];
 
 function buildResponsesForPath(
@@ -1757,21 +1771,35 @@ export function buildPublicOpenApiDocument(): YamlValue {
             name: "refresh",
             in: "query",
             required: false,
-            description: "Set to `\"1\"` to force a chain-to-index reconciliation before returning. Any other non-empty value is rejected with 400 `invalid_request`.",
+            description: "Set to `\"1\"` to force a chain-to-index reconciliation before returning. Any other non-empty value is rejected with 400 `invalid_request`. Repeating this parameter with conflicting scalar values (for example `refresh=1&refresh=0`) is rejected with 400 `invalid_request` and a field-level error on `refresh`; the server never silently picks the first or last value.",
             schema: { type: "string", enum: ["1"] },
           },
           {
             name: "cursor",
             in: "query",
             required: false,
-            description: "Positive integer claim ID cursor (`id < cursor`).",
+            description: "Positive integer claim ID cursor (`id < cursor`). Repeating `cursor` with conflicting values is rejected with 400 `invalid_request` and a field-level error on `cursor`.",
             schema: { type: "integer", minimum: 1 },
+          },
+          {
+            name: "categories",
+            in: "query",
+            required: false,
+            description: "Comma-separated category filter. At most 10 entries and 512 total bytes; exceeding either bound is rejected with 400 `invalid_request` before any read-index query.",
+            schema: { type: "array", maxItems: 10, items: { type: "string", enum: ["sports", "weather", "crypto", "culture", "custom"] } },
+          },
+          {
+            name: "states",
+            in: "query",
+            required: false,
+            description: "Comma-separated lifecycle state filter. At most 10 entries and 512 total bytes; exceeding either bound is rejected with 400 `invalid_request` before any read-index query.",
+            schema: { type: "array", maxItems: 10, items: { type: "string", enum: [...CLAIM_STATES] } },
           },
           {
             name: "limit",
             in: "query",
             required: false,
-            description: "Page size between 1 and 100 (defaults to 50).",
+            description: "Page size between 1 and 100 (defaults to 50). Repeating `limit` with conflicting values is rejected with 400 `invalid_request` and a field-level error on `limit`.",
             schema: { type: "integer", minimum: 1, maximum: 100, default: 50 },
           },
         ],
@@ -2489,6 +2517,9 @@ export function auditPublicApiDocument(input: {
                   `error code "${codeToCheck}" has retryable=${String(errObj?.retryable)}, expected ${String(spec.retryable)}`,
                 ),
               );
+            }
+            if (errObj && errObj.recoveryAction !== spec.recoveryAction) {
+              findings.push(finding("ERROR_RECOVERY_ACTION_DRIFT", "error", `$.paths.${pathKey}.get.responses.${statusKey}.examples.${expectedEx.name}`, "Published recovery action disagrees with the error catalogue"));
             }
           }
         }

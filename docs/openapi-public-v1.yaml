@@ -1590,6 +1590,28 @@ paths:
                         type: integer
                         minimum: 1
                         description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+                      projection:
+                        type: object
+                        description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+                        required:
+                          - trustedLedger
+                          - knownGaps
+                          - projectionGeneration
+                        additionalProperties: false
+                        properties:
+                          trustedLedger:
+                            type:
+                              - integer
+                              - "null"
+                            description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                          knownGaps:
+                            type: integer
+                            minimum: 0
+                            description: Count of known gaps or missing event spans in the projection.
+                          projectionGeneration:
+                            type: integer
+                            minimum: 1
+                            description: Active schema/projection generation version.
                   nextCursor:
                     type:
                       - integer
@@ -1683,6 +1705,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -1703,6 +1726,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -1755,6 +1785,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -1775,6 +1806,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -1800,6 +1838,7 @@ paths:
                       message: "ip limit exceeded; retry in 60s"
                       retryable: true
                       retryAfterSeconds: 60
+                      recoveryAction: retry_later
         "500":
           description: Internal server error.
           x-mimir-error-codes:
@@ -1829,6 +1868,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -1849,6 +1889,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -1874,6 +1921,7 @@ paths:
                       message: Unable to load VS feed
                       retryable: true
                       retryAfterSeconds: 5
+                      recoveryAction: retry_later
   "/api/vs/{id}":
     get:
       operationId: getVsById
@@ -2158,6 +2206,28 @@ paths:
                         type: integer
                         minimum: 1
                         description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+                      projection:
+                        type: object
+                        description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+                        required:
+                          - trustedLedger
+                          - knownGaps
+                          - projectionGeneration
+                        additionalProperties: false
+                        properties:
+                          trustedLedger:
+                            type:
+                              - integer
+                              - "null"
+                            description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                          knownGaps:
+                            type: integer
+                            minimum: 0
+                            description: Count of known gaps or missing event spans in the projection.
+                          projectionGeneration:
+                            type: integer
+                            minimum: 1
+                            description: Active schema/projection generation version.
               examples:
                 vsDetailPublic:
                   summary: Public claim detail served from the read index.
@@ -2298,6 +2368,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -2318,6 +2389,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -2370,6 +2448,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -2390,6 +2469,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -2441,6 +2527,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -2461,6 +2548,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -2486,6 +2580,7 @@ paths:
                       message: "ip limit exceeded; retry in 60s"
                       retryable: true
                       retryAfterSeconds: 60
+                      recoveryAction: retry_later
         "500":
           description: Internal server error.
           x-mimir-error-codes:
@@ -2515,6 +2610,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -2535,6 +2631,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -2560,6 +2663,7 @@ paths:
                       message: Unable to load VS
                       retryable: true
                       retryAfterSeconds: 5
+                      recoveryAction: retry_later
   "/api/vs/{id}/reasoning":
     get:
       operationId: getVsReasoningTimeline
@@ -3235,6 +3339,28 @@ paths:
                         type: integer
                         minimum: 1
                         description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+                      projection:
+                        type: object
+                        description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+                        required:
+                          - trustedLedger
+                          - knownGaps
+                          - projectionGeneration
+                        additionalProperties: false
+                        properties:
+                          trustedLedger:
+                            type:
+                              - integer
+                              - "null"
+                            description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                          knownGaps:
+                            type: integer
+                            minimum: 0
+                            description: Count of known gaps or missing event spans in the projection.
+                          projectionGeneration:
+                            type: integer
+                            minimum: 1
+                            description: Active schema/projection generation version.
               examples:
                 userVsFeed:
                   summary: Claims where the Stellar address participated as creator or challenger.
@@ -3321,6 +3447,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3341,6 +3468,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3393,6 +3527,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3413,6 +3548,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3438,6 +3580,7 @@ paths:
                       message: Unable to load user VS
                       retryable: true
                       retryAfterSeconds: 5
+                      recoveryAction: retry_later
   "/api/challenge-opportunities":
     get:
       operationId: listChallengeOpportunities
@@ -3643,6 +3786,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3663,6 +3807,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3715,6 +3866,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3735,6 +3887,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3786,6 +3945,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3806,6 +3966,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3831,6 +3998,7 @@ paths:
                       message: Unable to load challenge opportunities
                       retryable: true
                       retryAfterSeconds: 5
+                      recoveryAction: retry_later
         "503":
           description: Upstream dependency or database is temporarily unavailable.
           x-mimir-error-codes:
@@ -3860,6 +4028,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -3880,6 +4049,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -3905,6 +4081,7 @@ paths:
                       message: Draft generator is not configured
                       retryable: true
                       retryAfterSeconds: 30
+                      recoveryAction: retry_later
   "/api/performance/{address}":
     get:
       operationId: getPortfolioPerformance
@@ -3993,42 +4170,35 @@ paths:
                         type: integer
                         minimum: 1
                         description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
-                  coverage:
-                    type: object
-                    description: "Observation coverage metadata (`lib/portfolio-performance.ts::PerformanceObservationCoverage`)."
-                    required:
-                      - lastTrustedLedger
-                      - missingIntervals
-                    additionalProperties: false
-                    properties:
-                      lastTrustedLedger:
-                        type:
-                          - integer
-                          - "null"
-                        minimum: 0
-                        description: "Highest ledger sequence trusted by the read index, or null when unavailable."
-                      missingIntervals:
-                        type: array
-                        description: "Unobserved intervals that must remain visually distinct from verified zero performance."
-                        items:
-                          type: object
-                          description: "An unobserved interval in a performance series (`lib/portfolio-performance.ts::PerformanceMissingInterval`)."
-                          required:
-                            - startTimestamp
-                            - endTimestamp
-                          additionalProperties: false
-                          properties:
-                            startTimestamp:
-                              type: integer
-                              minimum: 1
-                              description: "Start of the missing interval in epoch milliseconds."
-                            endTimestamp:
-                              type: integer
-                              minimum: 1
-                              description: "End of the missing interval in epoch milliseconds."
-                            reason:
-                              type: string
-                              description: "Optional human-readable reason for the observation gap."
+                      projection:
+                        type: object
+                        description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+                        required:
+                          - trustedLedger
+                          - knownGaps
+                          - projectionGeneration
+                        additionalProperties: false
+                        properties:
+                          trustedLedger:
+                            type:
+                              - integer
+                              - "null"
+                            description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                          knownGaps:
+                            type: integer
+                            minimum: 0
+                            description: Count of known gaps or missing event spans in the projection.
+                          projectionGeneration:
+                            type: integer
+                            minimum: 1
+                            description: Active schema/projection generation version.
+                  state:
+                    type: string
+                    enum:
+                      - available
+                      - unavailable
+                      - insufficient-history
+                    description: "Explicit performance state without inventing zero returns: available when settled history exists, insufficient-history when no settled samples exist, unavailable when data could not be validated."
               examples:
                 portfolioPerformance:
                   summary: "Cumulative realised P&L series computed from settled markets."
@@ -4077,6 +4247,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -4097,6 +4268,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -4151,6 +4329,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -4171,6 +4350,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -4197,6 +4383,7 @@ paths:
                       message: Unable to load portfolio performance
                       retryable: true
                       retryAfterSeconds: 30
+                      recoveryAction: retry_later
   "/api/baskets":
     get:
       operationId: listBaskets
@@ -4300,6 +4487,7 @@ paths:
                           - unsupported_version
                           - payload_too_large
                           - idempotency_conflict
+                          - invalid_cursor
                           - unauthenticated
                           - nonce_reused
                           - request_expired
@@ -4320,6 +4508,13 @@ paths:
                       retryable:
                         type: boolean
                         description: Whether repeating the request after waiting or fixing freshness can succeed.
+                      recoveryAction:
+                        type: string
+                        enum:
+                          - refresh_request
+                          - reconnect_wallet
+                          - retry_later
+                        description: "Advisory recovery action; does not change retryable or authorize an operation."
                       retryAfterSeconds:
                         type: number
                         minimum: 0
@@ -4345,6 +4540,7 @@ paths:
                       message: "ip limit exceeded; retry in 60s"
                       retryable: true
                       retryAfterSeconds: 60
+                      recoveryAction: retry_later
   "/api/health":
     get:
       operationId: getHealthProbe
@@ -4456,6 +4652,12 @@ paths:
                             - "null"
                           minimum: 0
                       workerTraceIds:
+                        type: object
+                        additionalProperties:
+                          type:
+                            - string
+                            - "null"
+                      workerDetails:
                         type: object
                         additionalProperties:
                           type:
@@ -4617,6 +4819,12 @@ paths:
                           type:
                             - string
                             - "null"
+                      workerDetails:
+                        type: object
+                        additionalProperties:
+                          type:
+                            - string
+                            - "null"
                       agentBalancesUsdc:
                         type: object
                         additionalProperties:
@@ -4663,6 +4871,7 @@ components:
                 - unsupported_version
                 - payload_too_large
                 - idempotency_conflict
+                - invalid_cursor
                 - unauthenticated
                 - nonce_reused
                 - request_expired
@@ -4683,6 +4892,13 @@ components:
             retryable:
               type: boolean
               description: Whether repeating the request after waiting or fixing freshness can succeed.
+            recoveryAction:
+              type: string
+              enum:
+                - refresh_request
+                - reconnect_wallet
+                - retry_later
+              description: "Advisory recovery action; does not change retryable or authorize an operation."
             retryAfterSeconds:
               type: number
               minimum: 0
@@ -5267,11 +5483,11 @@ components:
             knownGaps:
               type: integer
               minimum: 0
-              description: "Count of known gaps or missing event spans in the projection."
+              description: Count of known gaps or missing event spans in the projection.
             projectionGeneration:
               type: integer
               minimum: 1
-              description: "Active schema/projection generation version."
+              description: Active schema/projection generation version.
     ClaimChallenger:
       type: object
       description: "A challenger entry on a claim (`lib/contract.ts::ClaimChallenger`)."
@@ -5763,6 +5979,28 @@ components:
               type: integer
               minimum: 1
               description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+            projection:
+              type: object
+              description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+              required:
+                - trustedLedger
+                - knownGaps
+                - projectionGeneration
+              additionalProperties: false
+              properties:
+                trustedLedger:
+                  type:
+                    - integer
+                    - "null"
+                  description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                knownGaps:
+                  type: integer
+                  minimum: 0
+                  description: Count of known gaps or missing event spans in the projection.
+                projectionGeneration:
+                  type: integer
+                  minimum: 1
+                  description: Active schema/projection generation version.
         nextCursor:
           type:
             - integer
@@ -6023,6 +6261,28 @@ components:
               type: integer
               minimum: 1
               description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+            projection:
+              type: object
+              description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+              required:
+                - trustedLedger
+                - knownGaps
+                - projectionGeneration
+              additionalProperties: false
+              properties:
+                trustedLedger:
+                  type:
+                    - integer
+                    - "null"
+                  description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                knownGaps:
+                  type: integer
+                  minimum: 0
+                  description: Count of known gaps or missing event spans in the projection.
+                projectionGeneration:
+                  type: integer
+                  minimum: 1
+                  description: Active schema/projection generation version.
     VSUserFeedResponse:
       type: object
       description: "Response payload for `GET /api/vs/user/{address}`."
@@ -6283,6 +6543,28 @@ components:
               type: integer
               minimum: 1
               description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
+            projection:
+              type: object
+              description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+              required:
+                - trustedLedger
+                - knownGaps
+                - projectionGeneration
+              additionalProperties: false
+              properties:
+                trustedLedger:
+                  type:
+                    - integer
+                    - "null"
+                  description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                knownGaps:
+                  type: integer
+                  minimum: 0
+                  description: Count of known gaps or missing event spans in the projection.
+                projectionGeneration:
+                  type: integer
+                  minimum: 1
+                  description: Active schema/projection generation version.
     ReasoningEvidenceRef:
       type: object
       description: "Captured source reference backing a reasoning event (`lib/reasoning/schema.ts::EvidenceRef`)."
@@ -6939,42 +7221,35 @@ components:
               type: integer
               minimum: 1
               description: "Target freshness window in milliseconds (60000 for feeds, 15000 for detail, 1 for direct contract reads)."
-        coverage:
-          type: object
-          description: "Observation coverage metadata (`lib/portfolio-performance.ts::PerformanceObservationCoverage`)."
-          required:
-            - lastTrustedLedger
-            - missingIntervals
-          additionalProperties: false
-          properties:
-            lastTrustedLedger:
-              type:
-                - integer
-                - "null"
-              minimum: 0
-              description: "Highest ledger sequence trusted by the read index, or null when unavailable."
-            missingIntervals:
-              type: array
-              description: "Unobserved intervals that must remain visually distinct from verified zero performance."
-              items:
-                type: object
-                description: "An unobserved interval in a performance series (`lib/portfolio-performance.ts::PerformanceMissingInterval`)."
-                required:
-                  - startTimestamp
-                  - endTimestamp
-                additionalProperties: false
-                properties:
-                  startTimestamp:
-                    type: integer
-                    minimum: 1
-                    description: "Start of the missing interval in epoch milliseconds."
-                  endTimestamp:
-                    type: integer
-                    minimum: 1
-                    description: "End of the missing interval in epoch milliseconds."
-                  reason:
-                    type: string
-                    description: "Optional human-readable reason for the observation gap."
+            projection:
+              type: object
+              description: "Projection completeness metadata for the snapshot (`lib/vs-freshness.ts`)."
+              required:
+                - trustedLedger
+                - knownGaps
+                - projectionGeneration
+              additionalProperties: false
+              properties:
+                trustedLedger:
+                  type:
+                    - integer
+                    - "null"
+                  description: "Highest verified ledger sequence folded into the projection, or null when unavailable."
+                knownGaps:
+                  type: integer
+                  minimum: 0
+                  description: Count of known gaps or missing event spans in the projection.
+                projectionGeneration:
+                  type: integer
+                  minimum: 1
+                  description: Active schema/projection generation version.
+        state:
+          type: string
+          enum:
+            - available
+            - unavailable
+            - insufficient-history
+          description: "Explicit performance state without inventing zero returns: available when settled history exists, insufficient-history when no settled samples exist, unavailable when data could not be validated."
     StoredBasket:
       type: object
       description: "A user-composed agent basket (`lib/db.ts::StoredBasket`)."
@@ -7148,6 +7423,12 @@ components:
             type:
               - string
               - "null"
+        workerDetails:
+          type: object
+          additionalProperties:
+            type:
+              - string
+              - "null"
         agentBalancesUsdc:
           type: object
           additionalProperties:
@@ -7254,6 +7535,12 @@ components:
                   - "null"
                 minimum: 0
             workerTraceIds:
+              type: object
+              additionalProperties:
+                type:
+                  - string
+                  - "null"
+            workerDetails:
               type: object
               additionalProperties:
                 type:
