@@ -38,9 +38,19 @@
  */
 export const NORMALIZATION_POLICY_VERSION = "v2";
 
+import {
+  interpretDeadline,
+  parseExplicitDeadline,
+  formatUtcOffset,
+  type DeadlineInterpretation,
+  type DeadlineParseResult,
+  type DeadlineRejectionReason,
+} from "./drafting.js";
+
 export interface CandidateLike {
   question?: string;
   resolutionUrl?: string;
+  /** Deadline timestamp (normalized to canonical UTC ISO-8601 when valid). */
   deadline?: string;
   category?: string;
   /** Identity of the source the draft was read from (e.g. feed or API id). */
@@ -104,11 +114,113 @@ function normaliseCategory(category: unknown): string {
   return String(category ?? "").toLowerCase().trim();
 }
 
-function normaliseDeadline(deadline: string | undefined): string {
+function extractExplicitZoneFromCandidate(
+  candidate: CandidateLike,
+): { ok: true; zone?: string; fromSourceZoneOnly: boolean } | { ok: false } {
+  const inputKeys = ["timeZone", "timezone", "deadlineTimeZone", "deadlineTimezone"] as const;
+  let selectedInput: string | undefined;
+
+  for (const key of inputKeys) {
+    const val = candidate[key];
+    if (val === undefined || val === null) continue;
+    if (typeof val !== "string") return { ok: false };
+    const trimmed = val.trim();
+    if (!trimmed) return { ok: false };
+    if (selectedInput !== undefined && selectedInput.toLowerCase() !== trimmed.toLowerCase()) {
+      return { ok: false };
+    }
+    selectedInput = trimmed;
+  }
+
+  if (candidate.sourceZone !== undefined && candidate.sourceZone !== null) {
+    if (typeof candidate.sourceZone !== "string") return { ok: false };
+    const trimmedSource = candidate.sourceZone.trim();
+    if (!trimmedSource) return { ok: false };
+    if (selectedInput !== undefined && selectedInput.toLowerCase() !== trimmedSource.toLowerCase()) {
+      return { ok: false };
+    }
+    if (selectedInput === undefined) {
+      return { ok: true, zone: trimmedSource, fromSourceZoneOnly: true };
+    }
+  }
+
+  return { ok: true, zone: selectedInput, fromSourceZoneOnly: false };
+}
+
+/**
+ * Resolve and validate the deadline on a candidate object, returning the
+ * canonical UTC timestamp and retained source time-zone metadata, or `null`
+ * if the deadline is missing, malformed, or an ambiguous local-only timestamp.
+ */
+export function resolveCandidateDeadline(candidate: CandidateLike): DeadlineInterpretation | null {
+  if (typeof candidate.deadline !== "string") return null;
+  const rawDeadline = candidate.deadline.trim();
+  if (!rawDeadline) return null;
+
+  const zoneField = extractExplicitZoneFromCandidate(candidate);
+  if (!zoneField.ok) return null;
+
+  // If the candidate already carries a validated deadlineInterpretation matching its canonical UTC deadline,
+  // verify it and preserve its original rawDeadline and sourceZone metadata.
+  if (
+    candidate.deadlineInterpretation &&
+    typeof candidate.deadlineInterpretation === "object" &&
+    candidate.deadlineInterpretation.canonicalUtc === rawDeadline &&
+    typeof candidate.deadlineInterpretation.rawDeadline === "string" &&
+    typeof candidate.deadlineInterpretation.sourceZone === "string"
+  ) {
+    const verified = interpretDeadline(
+      candidate.deadlineInterpretation.rawDeadline,
+      candidate.deadlineInterpretation.sourceZone,
+    );
+    if (verified && verified.canonicalUtc === rawDeadline) {
+      if (
+        zoneField.zone === undefined ||
+        zoneField.zone.toLowerCase() === verified.sourceZone.toLowerCase()
+      ) {
+        return verified;
+      }
+    }
+  }
+
+  const direct = interpretDeadline(rawDeadline, zoneField.zone);
+  if (direct) return direct;
+
+  // Handle already-normalized candidates where `deadline` is a canonical UTC `Z` string
+  // and `sourceZone` records the original non-UTC source zone as metadata.
+  if (zoneField.fromSourceZoneOnly && zoneField.zone && /[Zz]$/.test(rawDeadline)) {
+    const utcParsed = interpretDeadline(rawDeadline);
+    if (!utcParsed) return null;
+    // Validate that `sourceZone` itself is a legitimate explicit zone by probing a sample wall-clock date.
+    const zoneProbe = interpretDeadline("2026-01-15T12:00:00", zoneField.zone);
+    if (!zoneProbe) return null;
+    return {
+      canonicalUtc: utcParsed.canonicalUtc,
+      sourceZone: zoneProbe.sourceZone,
+      offsetMinutes: zoneProbe.offsetMinutes,
+      utcOffset: zoneProbe.utcOffset,
+      rawDeadline: candidate.deadlineInterpretation?.rawDeadline ?? rawDeadline,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Normalize a deadline string to its canonical UTC ISO-8601 timestamp.
+ *
+ * Requires an explicit time-zone designator in `deadline` (e.g. `Z` or `±HH:MM`)
+ * or an explicit `explicitZone` argument (IANA zone or UTC offset).
+ * Returns `""` when `deadline` is empty, malformed, or an ambiguous local-only value.
+ */
+export function normaliseDeadline(
+  deadline: string | undefined,
+  explicitZone?: string,
+): string {
   if (!deadline) return "";
-  const ms = Date.parse(deadline);
-  if (!Number.isFinite(ms)) return deadline.trim().toLowerCase();
-  return new Date(ms).toISOString();
+  const interpreted = interpretDeadline(deadline, explicitZone);
+  if (!interpreted) return "";
+  return interpreted.canonicalUtc;
 }
 
 function normaliseSnapshot(candidate: CandidateLike): string {
@@ -154,15 +266,16 @@ export function buildExistingClaimSignature(claim: {
 /**
  * Filter duplicate candidates while preserving input order.
  *
- * The first occurrence wins; later ones are dropped. The second argument is
- * either:
- *   - a `Set` of signatures from `buildCandidateSignature` (batch-level dedupe).
- *     Keys recorded under a different normalization policy version will not
- *     match and are therefore treated as incompatible rather than reused; or
- *   - the OPEN/ACTIVE claims read from the chain, which additionally drops any
- *     candidate that repeats an existing claim's question or resolution source
- *     in the same category. Within the batch, two drafts that share a question
- *     or source are only collapsed when they come from the same source snapshot.
+ * When a candidate specifies a `deadline`, it must have an explicit time-zone
+ * interpretation; candidates with ambiguous local-only or malformed deadlines
+ * are rejected. Kept candidates have their `deadline` normalized to a canonical
+ * UTC timestamp with `sourceZone` and `deadlineInterpretation` retained as metadata.
+ *
+ * The first occurrence of a signature wins; subsequent ones are dropped.
+ * An optional `seen` set can be passed in to also dedupe against candidates
+ * that already exist on-chain or in a previous batch. Keys recorded under a
+ * different normalization policy version will not match and are therefore
+ * treated as incompatible rather than reused.
  */
 export function filterDuplicateCandidates<T extends CandidateLike>(
   candidates: readonly T[],
