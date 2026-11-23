@@ -352,7 +352,7 @@ export async function ensureUsdcTrustline(
   const horizon = options.server ?? createHorizonServer();
   const account = await horizon.loadAccount(signer.publicKey);
 
-  const transaction = new TransactionBuilder(account, {
+  const transaction = new TransactionBuilder(sourceAccount, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   })
@@ -360,10 +360,25 @@ export async function ensureUsdcTrustline(
     .setTimeout(180)
     .build();
 
-  const { signedTxXdr } = await signer.signTransaction(transaction.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: signer.publicKey,
-  });
+  const maxRetries = options.maxRetries ?? 0;
+  let attempt = 0;
+
+  while (true) {
+    try {
+      const { signedTxXdr } = await signer.signTransaction(transaction.toXDR(), {
+        networkPassphrase: NETWORK_PASSPHRASE,
+        address: signer.publicKey,
+      });
+
+      const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+      const submitTx = resolveTransactionSubmitter(options);
+      const result = await submitTx(signed);
+      return { added: true, hash: result.hash };
+    } catch (cause) {
+      // User rejection: avoid retrying automatically.
+      if (isRejection(cause)) {
+        throw toWalletError(cause, "sign this transaction");
+      }
 
   // Verify that the signing intent is still active before submitting to Horizon.
   // Drops late wallet responses belonging to an obsolete generation or switched account.

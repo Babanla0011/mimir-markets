@@ -22,6 +22,7 @@ export interface UsdcTrustline extends TrustlineState {
   stale: boolean;
   loading: boolean;
   adding: boolean;
+  failureKind: "rejected" | "transport_unavailable" | null;
   add: () => Promise<boolean>;
   refresh: () => void;
   signingBlockedByOtherTab?: boolean;
@@ -44,6 +45,7 @@ export function useUsdcTrustline(): UsdcTrustline {
   const [checkedRevision, setCheckedRevision] = useState<number | null>(null);
   const [loading, setLoading] = useState(Boolean(address));
   const [adding, setAdding] = useState(false);
+  const [failureKind, setFailureKind] = useState<"rejected" | "transport_unavailable" | null>(null);
   const [tick, setTick] = useState(0);
 
   const addressRef = useRef(address);
@@ -55,7 +57,7 @@ export function useUsdcTrustline(): UsdcTrustline {
     if (!address) {
       setState({ status: "unknown", balance: null });
       setCheckedAddress(null);
-      setCheckedRevision(null);
+      setFailureKind(null);
       setLoading(false);
       return;
     }
@@ -89,7 +91,7 @@ export function useUsdcTrustline(): UsdcTrustline {
   const refresh = useCallback(() => {
     if (address) invalidateTrustlineRead(address);
     setCheckedAddress(null);
-    setCheckedRevision(null);
+    setFailureKind(null);
     setLoading(true);
     setTick((n) => n + 1);
   }, [address]);
@@ -100,6 +102,7 @@ export function useUsdcTrustline(): UsdcTrustline {
     const boundGeneration = generationRef.current;
     setAdding(true);
     setLoading(true);
+    setFailureKind(null);
     try {
       await ensureUsdcTrustline(signer, {
         intentGeneration: boundGeneration,
@@ -127,13 +130,17 @@ export function useUsdcTrustline(): UsdcTrustline {
         return false;
       }
       const message = err instanceof Error ? err.message : String(err);
-      toast.error(
-        /reject|denied|cancel/i.test(message)
-          ? t("trustlineRejected")
-          : /fund|account.*exist|not exist/i.test(message)
-            ? t("trustlineUnfunded")
-            : message,
-      );
+      if (isRejection(err)) {
+        setFailureKind("rejected");
+        toast.error(t("trustlineRejected"));
+      } else if (isTransportUnavailable(err)) {
+        setFailureKind("transport_unavailable");
+        toast.error(t("trustlineTransportUnavailable"));
+      } else if (/fund|account.*exist|not exist/i.test(message)) {
+        toast.error(t("trustlineUnfunded"));
+      } else {
+        toast.error(message);
+      }
       return false;
     } finally {
       setLoading(false);
@@ -157,6 +164,7 @@ export function useUsdcTrustline(): UsdcTrustline {
     ),
     loading,
     adding,
+    failureKind,
     add,
     refresh,
     signingBlockedByOtherTab,
@@ -343,6 +351,16 @@ function UsdcTrustlineGateView({
       <p className="mt-1 text-[12px] leading-relaxed text-pv-muted">
         {t("trustlineMissingHint")}
       </p>
+      {state.failureKind === "rejected" && (
+        <p className="mt-2 text-xs text-amber-400/90" role="status">
+          {t("trustlineRejected")}
+        </p>
+      )}
+      {state.failureKind === "transport_unavailable" && (
+        <p className="mt-2 text-xs text-pv-danger" role="alert">
+          {t("trustlineTransportUnavailable")}
+        </p>
+      )}
       <button
         type="button"
         onClick={async () => {
