@@ -301,6 +301,8 @@ export interface SettleDeps {
     evidence: string,
     jurorHistory?: string[],
   ) => Promise<OracleVerdict>;
+  /** Evaluate sports finality. Defaults to evaluateSportsFinality. */
+  evaluateSportsFinality?: typeof evaluateSportsFinality;
   /** Submit `resolve_claim`. Defaults to the real Soroban writer. */
   resolveClaim: (
     signer: typeof ORACLE.signer,
@@ -680,6 +682,7 @@ export async function settle(claim: ClaimOnChain, deps?: Partial<SettleDeps>): P
 
   const fetchEvidenceFn = deps?.fetchEvidence ?? fetchEvidence;
   const evaluateClaimFn = deps?.evaluateClaim ?? evaluateClaim;
+  const evaluateSportsFinalityFn = deps?.evaluateSportsFinality ?? evaluateSportsFinality;
   const resolveClaimFn  = deps?.resolveClaim  ?? resolveClaim;
 
   const evidence     = await fetchEvidenceFn(claim);
@@ -698,7 +701,13 @@ export async function settle(claim: ClaimOnChain, deps?: Partial<SettleDeps>): P
   // (unless we're past the grace window, to avoid locking funds on a data outage).
   if (claim.category.toLowerCase() === "sports") {
     const now = Math.floor(Date.now() / 1000);
-    if (!isSportsEventFinal(claim, evidence.text, now)) {
+    const sportsDecision = evaluateSportsFinalityFn(claim, evidence.text, now, {
+      evidenceTimestamp: evidence.fetchedAt ?? (now * 1000),
+    });
+    console.log(
+      `[settle] Claim #${claim.id}: sports finality decision [${sportsDecision.policyVersion}] — ${sportsDecision.final ? "final" : "defer"} (${sportsDecision.reason})`,
+    );
+    if (!sportsDecision.final) {
       console.log(`[settle] Claim #${claim.id}: match not final yet — deferring to a later poll.`);
       return false;
     }
