@@ -25,7 +25,10 @@ use crate::escrow;
 use crate::events;
 use crate::fees;
 use crate::storage;
-use crate::types::{Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason, Verdict, WinnerSide};
+use crate::types::{
+    Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason, Verdict,
+    WinnerSide,
+};
 use crate::util;
 
 /// Return the currently approved oracle resolution and claim expiration policy
@@ -260,6 +263,7 @@ pub fn resolve_claim_versioned(
     }
     .publish(env);
     
+    claim.revision = claim.revision.checked_add(1).ok_or(Error::Overflow)?;
     storage::set_claim(env, claim_id, &claim);
     claim_history::record(
         env,
@@ -518,6 +522,7 @@ pub fn claim_fees(env: &Env, who: Address) -> Result<i128, Error> {
     }
     let (plat_part, owner_part) = storage::clear_accrued_class_fees(env, &who);
     storage::clear_accrued_fees(env, &who); // effects before interaction
+    storage::add_claimed_fees(env, &who, amount);
     storage::add_lifetime_fees_claimed(env, amount);
 
     let unclassed = (amount - (plat_part + owner_part)).max(0);

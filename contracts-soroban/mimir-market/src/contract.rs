@@ -11,9 +11,11 @@ use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, CreateParams, Error, FeePolicy,
-    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
-    WinnerSide, VersionedPayoutQuote, MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, ContractLimits,
+    CreateParams, Error, FeePolicy, MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle,
+    PlatformStats, Verdict, WinnerSide, FEE_TIMELOCK_SECONDS, LIMITS_VERSION_V1, MAX_BATCH_SIZE,
+    MAX_CHALLENGERS, MAX_CLAIM_METADATA_BYTES, MAX_INVITE_KEY_BYTES, MAX_METADATA_BYTES,
+    MAX_TOTAL_FEE_BPS, ORACLE_TIMELOCK_SECONDS,
 };
 
 #[contract]
@@ -339,11 +341,21 @@ impl MimirMarket {
     ///
     /// Response layout: `(version, max_batch_size)`. `version` is bumped whenever
     /// the layout changes; existing fields keep their meaning across versions.
-    pub fn get_contract_limits(env: Env) -> Result<(u32, u32), Error> {
+    pub fn get_contract_limits(env: Env) -> Result<ContractLimits, Error> {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        Ok((1u32, MAX_BATCH_SIZE))
+        Ok(ContractLimits {
+            version: LIMITS_VERSION_V1,
+            max_challengers: MAX_CHALLENGERS,
+            max_batch_size: MAX_BATCH_SIZE,
+            max_invite_key_bytes: MAX_INVITE_KEY_BYTES,
+            max_metadata_bytes: MAX_METADATA_BYTES,
+            max_claim_metadata_bytes: MAX_CLAIM_METADATA_BYTES,
+            max_total_fee_bps: MAX_TOTAL_FEE_BPS,
+            fee_timelock_seconds: FEE_TIMELOCK_SECONDS,
+            oracle_timelock_seconds: ORACLE_TIMELOCK_SECONDS,
+        })
     }
 
     pub fn get_claim_market_config(env: Env, claim_id: u64) -> Result<MarketConfig, Error> {

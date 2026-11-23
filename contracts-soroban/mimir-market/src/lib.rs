@@ -28,10 +28,6 @@ pub use contract::{MimirMarket, MimirMarketClient};
 pub use types::*;
 
 #[cfg(test)]
-mod test_batch_get_claims;
-#[cfg(test)]
-mod test_batch_read;
-#[cfg(test)]
 mod test_challenge_lock;
 #[cfg(test)]
 mod test_common;
@@ -50,12 +46,15 @@ mod test_lifecycle;
 #[cfg(test)]
 mod test_pagination;
 #[cfg(test)]
-mod test_preflight;
-#[cfg(test)]
-mod test_rematch_status;
-#[cfg(test)]
-mod test_rounding_policy;
-#[cfg(test)]
 mod test_settlement;
 #[cfg(test)]
 mod test_verdict;
+#[cfg(test)]
+mod test_preflight;
+#[cfg(test)]
+mod test_batch_read;
+#[cfg(test)]
+mod test_batch_get_claims;
+#[cfg(test)]
+mod test_rematch_status;
+

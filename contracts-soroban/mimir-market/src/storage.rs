@@ -64,10 +64,8 @@ pub enum DataKey {
     Withdrawable(Address),
     /// Accrued, unclaimed fees. Always pulled, never pushed.
     Accrued(Address),
-    /// Accrued platform fees per recipient.
-    AccruedPlatform(Address),
-    /// Accrued agent owner fees per recipient.
-    AccruedAgentOwner(Address),
+    /// Lifetime fees already pulled by one recipient (monotonic).
+    ClaimedFees(Address),
     /// Rematch parent link validation cache: (parent_id, child_id) -> RematchStatus
     RematchParent(u64, u64),
     /// Per-creator claim index page: (creator, page_index) -> Vec<u64> of claim ids.
@@ -624,40 +622,21 @@ pub fn clear_accrued_fees(env: &Env, who: &Address) {
     set_address_i128(env, DataKey::Accrued(who.clone()), 0);
 }
 
-pub fn accrued_class_fees(env: &Env, who: &Address, class: FeeRecipientClass) -> i128 {
-    match class {
-        FeeRecipientClass::Platform => address_i128(env, DataKey::AccruedPlatform(who.clone())),
-        FeeRecipientClass::AgentOwner => address_i128(env, DataKey::AccruedAgentOwner(who.clone())),
-    }
+/// Lifetime fees credited to `who`. Same value as [`accrued_fees`], named for
+/// the fee-ledger readers that report accrued/claimed/outstanding together.
+pub fn get_accrued_fees(env: &Env, who: &Address) -> i128 {
+    accrued_fees(env, who)
 }
 
-pub fn add_accrued_class_fees(env: &Env, who: &Address, class: FeeRecipientClass, delta: i128) {
-    match class {
-        FeeRecipientClass::Platform => {
-            let key = DataKey::AccruedPlatform(who.clone());
-            let next = address_i128(env, key.clone()) + delta;
-            set_address_i128(env, key, next);
-        }
-        FeeRecipientClass::AgentOwner => {
-            let key = DataKey::AccruedAgentOwner(who.clone());
-            let next = address_i128(env, key.clone()) + delta;
-            set_address_i128(env, key, next);
-        }
-    }
+/// Lifetime fees `who` has already pulled.
+pub fn get_claimed_fees(env: &Env, who: &Address) -> i128 {
+    address_i128(env, DataKey::ClaimedFees(who.clone()))
 }
 
-pub fn clear_accrued_class_fees(env: &Env, who: &Address) -> (i128, i128) {
-    let plat_key = DataKey::AccruedPlatform(who.clone());
-    let owner_key = DataKey::AccruedAgentOwner(who.clone());
-    let plat_amt = address_i128(env, plat_key.clone());
-    let owner_amt = address_i128(env, owner_key.clone());
-    if plat_amt > 0 {
-        set_address_i128(env, plat_key, 0);
-    }
-    if owner_amt > 0 {
-        set_address_i128(env, owner_key, 0);
-    }
-    (plat_amt, owner_amt)
+pub fn add_claimed_fees(env: &Env, who: &Address, delta: i128) {
+    let key = DataKey::ClaimedFees(who.clone());
+    let next = address_i128(env, key.clone()) + delta;
+    set_address_i128(env, key, next);
 }
 
 /// Read accrued, unclaimed fees without any pause check.

@@ -337,6 +337,10 @@ pub struct Claim {
     /// whatever `remaining_escrow` is left, so truncation dust is never stranded.
     pub challenger_claims: u32,
     pub created_at: u64,
+    /// Monotonic revision of this claim's stored state. Creation starts at 1
+    /// and every successful lifecycle mutation increments it, so a reviewer can
+    /// pin an expected revision before submitting a guarded change.
+    pub revision: u32,
     pub evidence_hash: Option<BytesN<32>>,
     pub context_hash: BytesN<32>,
     pub market: MarketConfig,
@@ -695,9 +699,7 @@ pub enum Error {
     /// in). The write is refused so the contract never records an impossible
     /// state.
     ConservationViolation = 47,
-    /// The required payout rounding policy is unsupported. Use a supported
-    /// preview version before submitting a pull; no funds or state are changed.
-    UnsupportedRoundingPolicyVersion = 50,
-    /// Ownership transfer was blocked by the existing withdrawal pause guard.
-    Paused = 49,
+    /// The market is paused: state-changing operations that are not withdrawals
+    /// or fee pulls are refused.
+    Paused = 48,
 }
