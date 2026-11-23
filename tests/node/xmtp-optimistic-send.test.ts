@@ -14,14 +14,10 @@ type Row = {
   [key: string]: unknown;
 };
 
-type NormalizedId = ReturnType<typeof normalizeXmtpMessageId>;
-
-type ThreadRow = Row & { kind?: string; message?: unknown };
-
-const idOf = (r: unknown): string => String((r as Row).id);
+type NormalizeInput = string | null | undefined;
 
 describe("normalizeXmtpMessageId", () => {
-  const cases: Array<[string | null | undefined, NormalizedId]> = [
+  const cases: Array<[NormalizeInput, string | null]> = [
     ["abc123", "abc123"],
     ["  abc123  ", "abc123"],
     ["ABC123", "abc123"],
