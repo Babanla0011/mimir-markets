@@ -140,6 +140,99 @@ export interface MirrorReviewQueueResult {
   invalidated: InvalidatedBasketComposition[];
 }
 
+export type MirrorQueueSource =
+  | "subscriptions"
+  | "definitions"
+  | "agents"
+  | "open_claims"
+  | "challengers";
+
+export type MirrorQueueStatus =
+  | "invalid_subscriber"
+  | "no_subscriptions"
+  | "complete"
+  | "incomplete";
+
+export interface MirrorQueueSourceFailure {
+  source: MirrorQueueSource;
+  /** Present when a per-claim challenger lookup failed. */
+  claimId?: number;
+  /** Bounded, single-line error message. */
+  message: string;
+}
+
+export interface MirrorQueueFailureSummary {
+  /** Total number of source failures encountered (may exceed failures.length). */
+  totalFailures: number;
+  /** Distinct unavailable sources in deterministic order. */
+  unavailableSources: MirrorQueueSource[];
+  /** Bounded list of failure details (capped at MAX_MIRROR_QUEUE_FAILURES). */
+  failures: MirrorQueueSourceFailure[];
+  /** True when additional failures were omitted to keep the summary bounded. */
+  truncated: boolean;
+  /** Short actionable summary suitable for API responses, UI, and logs. */
+  summary: string;
+}
+
+export interface MirrorQueueResult {
+  status: MirrorQueueStatus;
+  /** True when all required sources succeeded. */
+  complete: boolean;
+  mirrors: PendingMirror[];
+  /** Basket IDs the subscriber follows (empty when unavailable or none). */
+  following: string[];
+  /** Bounded failure summary when status === "incomplete"; null otherwise. */
+  failureSummary: MirrorQueueFailureSummary | null;
+}
+
+export const MAX_MIRROR_QUEUE_FAILURES = 10;
+export const MAX_MIRROR_QUEUE_FAILURE_MESSAGE_LENGTH = 160;
+
+const SOURCE_ORDER: readonly MirrorQueueSource[] = [
+  "subscriptions",
+  "definitions",
+  "agents",
+  "open_claims",
+  "challengers",
+];
+
+function formatSourceError(error: unknown): string {
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized) return "Source unavailable";
+  if (normalized.length <= MAX_MIRROR_QUEUE_FAILURE_MESSAGE_LENGTH) {
+    return normalized;
+  }
+  return `${normalized.slice(0, MAX_MIRROR_QUEUE_FAILURE_MESSAGE_LENGTH - 1)}…`;
+}
+
+function buildFailureSummary(
+  recordedFailures: MirrorQueueSourceFailure[],
+  failedSources: Set<MirrorQueueSource>,
+  totalFailures: number,
+): MirrorQueueFailureSummary {
+  const unavailableSources = SOURCE_ORDER.filter((source) => failedSources.has(source));
+  const truncated = totalFailures > recordedFailures.length;
+  const sourceList = unavailableSources.join(", ");
+  const countDetail = truncated
+    ? `${totalFailures} failures recorded (showing first ${recordedFailures.length})`
+    : `${totalFailures} failure${totalFailures === 1 ? "" : "s"} recorded`;
+  const summary = `Mirror queue incomplete: unavailable ${sourceList} (${countDetail}).`;
+
+  return {
+    totalFailures,
+    unavailableSources,
+    failures: recordedFailures,
+    truncated,
+    summary,
+  };
+}
+
 /** The data sources the queue is built from, injectable for testing. */
 export interface MirrorQueueDependencies {
   listSubscriptions: (wallet: string) => Promise<string[]>;
@@ -374,50 +467,108 @@ function evaluateReviewedComposition(
 }
 
 /**
- * Compute pending mirror previews alongside versioned composition snapshots and
- * any baskets invalidated due to material composition changes since follower review.
+ * Resolve pending mirrors along with completeness metadata and a bounded
+ * failure summary when one or more backing sources are unavailable.
+ *
+ * Callers can distinguish:
+ *  - `status === "invalid_subscriber"` — address failed StrKey validation
+ *  - `status === "no_subscriptions"`   — subscriber follows no baskets
+ *  - `status === "complete"`           — all sources succeeded (empty `mirrors`
+ *                                        means genuinely no eligible opportunities)
+ *  - `status === "incomplete"`         — one or more sources failed; `mirrors`
+ *                                        contains any partial results and
+ *                                        `failureSummary` explains what failed
  */
-export async function reviewPendingMirrorsFor(
+export async function pendingMirrorQueueFor(
   subscriber: string,
   perMarketUsdc: Record<string, number> = {},
   dependencies: MirrorQueueDependencies = defaultDependencies,
-  options: MirrorQueueOptions = {},
-): Promise<MirrorReviewQueueResult> {
+): Promise<MirrorQueueResult> {
   // Strkey check, and the address is then used verbatim throughout. The EVM regex
   // this replaced rejected every Stellar address, so the mirror queue was empty
   // for every real user; the `toLowerCase()` beside it would then have failed to
   // match any stored strkey even if the guard had let one through.
   const wallet = parseAddressParam(subscriber);
   if (!wallet) {
-    return { mirrors: [], snapshots: {}, invalidated: [] };
+    return {
+      status: "invalid_subscriber",
+      complete: true,
+      mirrors: [],
+      following: [],
+      failureSummary: null,
+    };
   }
 
-  const subscribed = await dependencies.listSubscriptions(wallet).catch(() => []);
+  const recordedFailures: MirrorQueueSourceFailure[] = [];
+  const failedSources = new Set<MirrorQueueSource>();
+  let totalFailures = 0;
+
+  const recordFailure = (source: MirrorQueueSource, error: unknown, claimId?: number) => {
+    totalFailures += 1;
+    failedSources.add(source);
+    if (recordedFailures.length < MAX_MIRROR_QUEUE_FAILURES) {
+      const entry: MirrorQueueSourceFailure = {
+        source,
+        message: formatSourceError(error),
+      };
+      if (claimId !== undefined) entry.claimId = claimId;
+      recordedFailures.push(entry);
+    }
+  };
+
+  let subscribed: string[];
+  try {
+    subscribed = await dependencies.listSubscriptions(wallet);
+  } catch (error) {
+    recordFailure("subscriptions", error);
+    return {
+      status: "incomplete",
+      complete: false,
+      mirrors: [],
+      following: [],
+      failureSummary: buildFailureSummary(recordedFailures, failedSources, totalFailures),
+    };
+  }
+
   if (subscribed.length === 0) {
-    return { mirrors: [], snapshots: {}, invalidated: [] };
+    return {
+      status: "no_subscriptions",
+      complete: true,
+      mirrors: [],
+      following: [],
+      failureSummary: null,
+    };
   }
 
-  const [definitions, directory, openClaims, depReviewed] = await Promise.all([
-    dependencies.listDefinitions().catch(() => []),
-    dependencies.listAgents().catch(() => []),
-    dependencies.listOpenClaims().catch(() => []),
-    dependencies.listReviewedCompositions
-      ? dependencies.listReviewedCompositions(wallet).catch(() => ({}))
-      : Promise.resolve({} as Record<string, ReviewedBasketComposition>),
+  const [definitionsResult, directoryResult, openClaimsResult] = await Promise.allSettled([
+    dependencies.listDefinitions(),
+    dependencies.listAgents(),
+    dependencies.listOpenClaims(),
   ]);
 
-  const reviewedCompositions: Record<string, ReviewedBasketComposition> = {
-    ...depReviewed,
-    ...(options.reviewedCompositions ?? {}),
-  };
-  const materialDriftBps =
-    options.materialDriftBps ??
-    dependencies.materialDriftBps ??
-    DEFAULT_MATERIAL_COMPOSITION_DRIFT_BPS;
+  const definitions =
+    definitionsResult.status === "fulfilled"
+      ? definitionsResult.value
+      : (recordFailure("definitions", definitionsResult.reason), []);
+  const directory =
+    directoryResult.status === "fulfilled"
+      ? directoryResult.value
+      : (recordFailure("agents", directoryResult.reason), []);
+  const openClaims =
+    openClaimsResult.status === "fulfilled"
+      ? openClaimsResult.value
+      : (recordFailure("open_claims", openClaimsResult.reason), []);
 
   const agentById = new Map(directory.map((agent) => [agent.id, agent]));
   const nowMs = Date.now();
   const nowSeconds = Math.floor(nowMs / 1000);
+
+  // Cache challenger lookups per claim so shared claims across multiple baskets
+  // are queried once and failures are not double-counted.
+  const challengersByClaim = new Map<
+    number,
+    { ok: true; challengers: Array<{ address: string; stake: number }> } | { ok: false }
+  >();
 
   // Cache challenger lookups per claim so shared claims across multiple baskets
   // are queried once and failures are not double-counted.
@@ -520,10 +671,24 @@ export async function reviewPendingMirrorsFor(
     }
   }
 
+  pending.sort((a, b) => a.deadline - b.deadline);
+
+  if (totalFailures > 0) {
+    return {
+      status: "incomplete",
+      complete: false,
+      mirrors: pending,
+      following: subscribed,
+      failureSummary: buildFailureSummary(recordedFailures, failedSources, totalFailures),
+    };
+  }
+
   return {
-    mirrors: pending.sort((a, b) => a.deadline - b.deadline),
-    snapshots,
-    invalidated,
+    status: "complete",
+    complete: true,
+    mirrors: pending,
+    following: subscribed,
+    failureSummary: null,
   };
 }
 
@@ -534,227 +699,14 @@ export async function reviewPendingMirrorsFor(
  * subscriber's per-market budget, or following a basket would just be following
  * whichever member happened to act first.
  *
- * When the follower has a pinned/reviewed composition snapshot for a basket and
- * the basket's composition has since changed materially, previews for that basket
- * are invalidated and excluded from the returned list.
+ * Kept for callers that only need the mirror array; use `pendingMirrorQueueFor`
+ * when you need to distinguish empty results from unavailable sources.
  */
 export async function pendingMirrorsFor(
   subscriber: string,
   perMarketUsdc: Record<string, number> = {},
   dependencies: MirrorQueueDependencies = defaultDependencies,
-  options: MirrorQueueOptions = {},
 ): Promise<PendingMirror[]> {
-  const result = await reviewPendingMirrorsFor(
-    subscriber,
-    perMarketUsdc,
-    dependencies,
-    options,
-  );
+  const result = await pendingMirrorQueueFor(subscriber, perMarketUsdc, dependencies);
   return result.mirrors;
-}
-
-/**
- * Validate previously generated pending mirror previews against the latest
- * basket definitions, invalidating any preview whose basket composition has
- * changed materially.
- */
-export function validatePendingMirrorPreviews(
-  previews: readonly PendingMirror[],
-  definitions: readonly MirrorQueueBasketDefinition[],
-  options: MirrorQueueOptions = {},
-): ValidateMirrorPreviewsResult {
-  const defaultDriftBps =
-    options.materialDriftBps ?? DEFAULT_MATERIAL_COMPOSITION_DRIFT_BPS;
-  const defById = new Map(definitions.map((d) => [d.id, d]));
-  const nowMs = Date.now();
-
-  const valid: PendingMirror[] = [];
-  const invalidated: InvalidatedMirrorPreview[] = [];
-
-  for (const preview of previews) {
-    const definition = defById.get(preview.basketId);
-    if (!definition) {
-      invalidated.push({
-        mirror: preview,
-        reason: "basket_not_found",
-      });
-      continue;
-    }
-
-    const liveSnapshot = resolveLiveSnapshot(definition, nowMs);
-    if (!liveSnapshot) {
-      invalidated.push({
-        mirror: preview,
-        reason: "invalid_basket_composition",
-      });
-      continue;
-    }
-
-    if (
-      !isHash32Hex(preview.compositionDigest) ||
-      !Number.isSafeInteger(preview.compositionVersion) ||
-      preview.compositionVersion < 1 ||
-      !Number.isInteger(preview.weightBps) ||
-      preview.weightBps <= 0
-    ) {
-      invalidated.push({
-        mirror: preview,
-        reason: "invalid_reviewed_snapshot",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    const previewDigest = preview.compositionDigest.toLowerCase();
-
-    if (liveSnapshot.version < preview.compositionVersion) {
-      invalidated.push({
-        mirror: preview,
-        reason: "version_regression",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    const currentMember = liveSnapshot.members.find(
-      (member) => member.agentId === preview.agentId,
-    );
-    if (!currentMember) {
-      invalidated.push({
-        mirror: preview,
-        reason: "member_removed",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    const reviewed = options.reviewedCompositions?.[preview.basketId];
-    const thresholdBps =
-      (typeof reviewed === "object" &&
-      reviewed !== null &&
-      "materialDriftBps" in reviewed &&
-      reviewed.materialDriftBps !== undefined
-        ? reviewed.materialDriftBps
-        : undefined) ?? defaultDriftBps;
-
-    if (
-      !Number.isInteger(thresholdBps) ||
-      thresholdBps < 1 ||
-      thresholdBps > 10_000
-    ) {
-      invalidated.push({
-        mirror: preview,
-        reason: "invalid_reviewed_snapshot",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    if (
-      typeof reviewed === "object" &&
-      reviewed !== null &&
-      reviewed.members !== undefined
-    ) {
-      let reviewedDigest: string;
-      try {
-        reviewedDigest = basketCompositionDigest(reviewed.members);
-      } catch {
-        invalidated.push({
-          mirror: preview,
-          reason: "invalid_reviewed_snapshot",
-          currentVersion: liveSnapshot.version,
-          currentDigest: liveSnapshot.compositionDigest,
-        });
-        continue;
-      }
-
-      if (
-        reviewedDigest !== previewDigest ||
-        (typeof reviewed.compositionDigest === "string" &&
-          reviewed.compositionDigest.trim().toLowerCase() !== previewDigest)
-      ) {
-        invalidated.push({
-          mirror: preview,
-          reason: "invalid_reviewed_snapshot",
-          currentVersion: liveSnapshot.version,
-          currentDigest: liveSnapshot.compositionDigest,
-        });
-        continue;
-      }
-
-      const diff = compareBasketCompositions(
-        reviewed.members,
-        liveSnapshot.members,
-        { materialDriftBps: thresholdBps },
-      );
-
-      if (diff.materialChange) {
-        invalidated.push({
-          mirror: preview,
-          reason:
-            diff.reason === "members_changed"
-              ? "members_changed"
-              : "weights_changed_materially",
-          currentVersion: liveSnapshot.version,
-          currentDigest: liveSnapshot.compositionDigest,
-          diff,
-        });
-        continue;
-      }
-
-      if (Math.abs(currentMember.weightBps - preview.weightBps) >= thresholdBps) {
-        invalidated.push({
-          mirror: preview,
-          reason: "weights_changed_materially",
-          currentVersion: liveSnapshot.version,
-          currentDigest: liveSnapshot.compositionDigest,
-          diff,
-        });
-        continue;
-      }
-
-      valid.push(preview);
-      continue;
-    }
-
-    if (Math.abs(currentMember.weightBps - preview.weightBps) >= thresholdBps) {
-      invalidated.push({
-        mirror: preview,
-        reason: "weights_changed_materially",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    if (previewDigest !== liveSnapshot.compositionDigest) {
-      invalidated.push({
-        mirror: preview,
-        reason: "composition_digest_mismatch",
-        currentVersion: liveSnapshot.version,
-        currentDigest: liveSnapshot.compositionDigest,
-      });
-      continue;
-    }
-
-    valid.push(preview);
-  }
-
-  return { valid, invalidated };
-}
-
-/**
- * Filter a list of pending mirror previews down to those still valid under
- * the current basket definitions.
- */
-export function invalidateStaleMirrorPreviews(
-  previews: readonly PendingMirror[],
-  definitions: readonly MirrorQueueBasketDefinition[],
-  options: MirrorQueueOptions = {},
-): PendingMirror[] {
-  return validatePendingMirrorPreviews(previews, definitions, options).valid;
 }

@@ -46,14 +46,6 @@ export async function GET(req: NextRequest) {
 
   const result = await pendingMirrorQueueFor(subscriber);
 
-  if (includePreviews) {
-    const previews = await previewFollowerMirrors({ subscriber }).catch(() => []);
-    return NextResponse.json(
-      { mirrors, following: subscriptions, previews },
-      { headers: { "cache-control": "no-store" } },
-    );
-  }
-
   return NextResponse.json(
     {
       mirrors: result.mirrors,
