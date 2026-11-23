@@ -34,27 +34,14 @@ export const SPORTS_EVIDENCE_MANIFEST_MAX_ITEMS = 20
 /** Maximum length of a retained source reference string. */
 export const SPORTS_EVIDENCE_SOURCE_REF_MAX_LEN = 256
 
+export function sportsGraceSecs(
+  hours: number | string = process.env.SPORTS_SETTLE_GRACE_HOURS ?? SPORTS_SETTLE_GRACE_HOURS_DEFAULT,
+): number {
+  return Math.max(1, Number(hours)) * 3600
+}
+
 /** Grace window in seconds, honoring SPORTS_SETTLE_GRACE_HOURS (default 12h). */
-export const SPORTS_SETTLE_GRACE_SECS =
-  Math.max(1, Number(process.env.SPORTS_SETTLE_GRACE_HOURS ?? SPORTS_SETTLE_GRACE_HOURS_DEFAULT)) * 3600;
-
-/**
- * Bounded oracle retry budget per unresolved claim. Evidence acquisition
- * retries are counted separately from transaction reconciliation so a flaky
- * evidence source cannot exhaust the settlement retry budget (and vice versa).
- */
-export const ORACLE_EVIDENCE_RETRY_BUDGET_DEFAULT = 3
-export const ORACLE_SETTLEMENT_RETRY_BUDGET_DEFAULT = 3
-
-/** Bounded evidence failure classes recorded in decision journals. */
-export type EvidenceFailureClass = 'unavailable' | 'stale' | 'malformed' | 'unsupported'
-
-export const EVIDENCE_FAILURE_CLASSES: readonly EvidenceFailureClass[] = [
-  'unavailable',
-  'stale',
-  'malformed',
-  'unsupported',
-]
+export const SPORTS_SETTLE_GRACE_SECS = sportsGraceSecs()
 
 /** Claim fields the check needs. */
 export interface SportsClaim {
@@ -337,8 +324,13 @@ export const SPORTS_EVIDENCE_MAX_AGE_SECS = 6 * 3600
  *   - evidence shows live / upcoming / postponed → false (defer)
  *   - anything unrecognised → false (defer; the safe default)
  */
-export function isSportsEventFinal(claim: SportsClaim, evidenceText: string, now: number): boolean {
-  const pastGrace = now > claim.deadline + SPORTS_SETTLE_GRACE_SECS
+export function isSportsEventFinal(
+  claim: SportsClaim,
+  evidenceText: string,
+  now: number,
+  graceSecs: number = SPORTS_SETTLE_GRACE_SECS,
+): boolean {
+  const pastGrace = now > claim.deadline + graceSecs
   if (pastGrace) return true
   return eventLooksFinal(evidenceText)
 }
