@@ -21,6 +21,7 @@ import {
   cancelProposal,
   markProposalDependencyFailed,
   markStaleProposals,
+  recordProposalReviewDecision,
   updateProposalReviewStatus,
   listProposalsForReview,
   getProposal,
@@ -29,9 +30,11 @@ import {
   type MarketProposalRow,
 } from "@/lib/db";
 import {
-  validateSignedWindow,
-  validateReviewRevision,
-} from "@/lib/signed-window";
+  decisionForReviewStatus,
+  defaultReasonCodeForDecision,
+  isProposalReviewReasonCode,
+  type ProposalReviewReasonCode,
+} from "@/lib/proposal-review-history";
 
 export const runtime = "nodejs";
 
@@ -223,13 +226,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return errorResponse("Invalid JSON body", 400);
   }
 
-  const { action, proposalId, reviewer, approve, reason, approvedDigest } = body as {
-    action: "claim" | "complete" | "cancel" | "mark_stale" | "mark_dependency_failed";
+  const { action, proposalId, reviewer, approve, reason, reasonCode, privateNote, supersededByProposalId } = body as {
+    action: "claim" | "complete" | "cancel" | "supersede" | "expire" | "mark_stale" | "mark_dependency_failed";
     proposalId?: string;
     reviewer?: string;
     approve?: boolean;
     reason?: string;
-    approvedDigest?: string;
+    reasonCode?: string;
+    privateNote?: string;
+    supersededByProposalId?: string;
   };
 
   if (
@@ -248,37 +253,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return errorResponse("Missing action", 400);
   }
 
-  if (nonce !== undefined || expiresAt !== undefined) {
-    const windowResult = validateSignedWindow(nonce, expiresAt);
-    if (!windowResult.ok) {
-      const err = apiError(windowResult.code, windowResult.message, { field: windowResult.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
+  let validatedReasonCode: ProposalReviewReasonCode | undefined;
+  if (reasonCode !== undefined) {
+    if (!isProposalReviewReasonCode(reasonCode)) {
+      return errorResponse(`Invalid reasonCode: ${reasonCode}`, 400);
     }
-  }
-
-  if (expectedRevision !== undefined) {
-    const formatCheck = validateReviewRevision(expectedRevision);
-    if (!formatCheck.ok) {
-      const err = apiError(formatCheck.code, formatCheck.message, { field: formatCheck.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
-    if (!proposalId) {
-      const err = apiError("invalid_request", "expectedRevision requires proposalId", {
-        field: "expectedRevision",
-      });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
-    const currentProposal = await getProposal(proposalId);
-    if (!currentProposal) {
-      const err = apiError("not_found", `Proposal not found: ${proposalId}`);
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
-    const currentRevision = getProposalRevision(currentProposal);
-    const revCheck = validateReviewRevision(expectedRevision, currentRevision);
-    if (!revCheck.ok) {
-      const err = apiError(revCheck.code, revCheck.message, { field: revCheck.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
+    validatedReasonCode = reasonCode;
   }
 
   try {
@@ -331,11 +311,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           }
           return errorResponse("Proposal not in review by this reviewer", 409);
         }
+        const decision = approve ? "accepted" : "rejected";
+        const effectiveReasonCode = validatedReasonCode ?? defaultReasonCodeForDecision(decision);
+        await recordProposalReviewDecision({
+          proposalId,
+          decision,
+          reasonCode: effectiveReasonCode,
+          actorId: reviewer,
+          privateNote: privateNote ?? reason ?? null,
+        });
         return json({
           success: true,
           proposalId,
           status: approve ? "approved" : "rejected",
-          ...(approve ? { approvedDigest } : {}),
+          decision,
+          reasonCode: effectiveReasonCode,
         });
       }
 
@@ -353,7 +343,79 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         if (!ok) {
           return errorResponse("Proposal not cancellable (not queued or in_review)", 409);
         }
-        return json({ success: true, proposalId: targetId, status: "cancelled" });
+        const decision = supersededByProposalId ? "superseded" : "rejected";
+        const effectiveReasonCode =
+          validatedReasonCode ??
+          (supersededByProposalId ? "SUPERSEDED_BY_NEWER_PROPOSAL" : "CANCELLED_BY_OPERATOR");
+        await recordProposalReviewDecision({
+          proposalId,
+          decision,
+          reasonCode: effectiveReasonCode,
+          supersededByProposalId: supersededByProposalId ?? null,
+          actorId: reviewer ?? null,
+          privateNote: privateNote ?? reason,
+        });
+        return json({
+          success: true,
+          proposalId,
+          status: "cancelled",
+          decision,
+          reasonCode: effectiveReasonCode,
+        });
+      }
+
+      case "supersede": {
+        if (!proposalId || !supersededByProposalId) {
+          return errorResponse("supersede requires proposalId and supersededByProposalId", 400);
+        }
+        const ok = await cancelProposal(proposalId, reason ?? `superseded by ${supersededByProposalId}`);
+        if (!ok) {
+          return errorResponse("Proposal not superseding-eligible (not queued or in_review)", 409);
+        }
+        const effectiveReasonCode = validatedReasonCode ?? "SUPERSEDED_BY_NEWER_PROPOSAL";
+        await recordProposalReviewDecision({
+          proposalId,
+          decision: "superseded",
+          reasonCode: effectiveReasonCode,
+          supersededByProposalId,
+          actorId: reviewer ?? null,
+          privateNote: privateNote ?? reason ?? null,
+        });
+        return json({
+          success: true,
+          proposalId,
+          status: "cancelled",
+          decision: "superseded",
+          reasonCode: effectiveReasonCode,
+          supersededByProposalId,
+        });
+      }
+
+      case "expire": {
+        if (!proposalId) {
+          return errorResponse("expire requires proposalId", 400);
+        }
+        const effectiveReasonCode = validatedReasonCode ?? "REVIEW_DEADLINE_EXPIRED";
+        const ok = await updateProposalReviewStatus(proposalId, "stale", {
+          failureReason: reason ?? effectiveReasonCode,
+        });
+        if (!ok) {
+          return errorResponse("Proposal not found or could not be expired", 409);
+        }
+        await recordProposalReviewDecision({
+          proposalId,
+          decision: "expired",
+          reasonCode: effectiveReasonCode,
+          actorId: reviewer ?? null,
+          privateNote: privateNote ?? reason ?? null,
+        });
+        return json({
+          success: true,
+          proposalId,
+          status: "stale",
+          decision: "expired",
+          reasonCode: effectiveReasonCode,
+        });
       }
 
       case "mark_dependency_failed": {
@@ -364,7 +426,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         if (!ok) {
           return errorResponse("Proposal not in a state that can be marked as dependency_failed", 409);
         }
-        return json({ success: true, proposalId, status: "dependency_failed" });
+        const effectiveReasonCode = validatedReasonCode ?? "DEPENDENCY_FAILED";
+        await recordProposalReviewDecision({
+          proposalId,
+          decision: "rejected",
+          reasonCode: effectiveReasonCode,
+          actorId: reviewer ?? null,
+          privateNote: privateNote ?? reason,
+        });
+        return json({
+          success: true,
+          proposalId,
+          status: "dependency_failed",
+          decision: "rejected",
+          reasonCode: effectiveReasonCode,
+        });
       }
 
       case "mark_stale": {
@@ -397,22 +473,14 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
     return errorResponse("Invalid JSON body", 400);
   }
 
-  const {
-    proposalId,
-    status,
-    reviewer,
-    failureReason,
-    nonce,
-    expiresAt,
-    expectedRevision,
-  } = (body ?? {}) as {
+  const { proposalId, status, reviewer, failureReason, reasonCode, privateNote, supersededByProposalId } = body as {
     proposalId: string;
     status: ReviewStatus;
     reviewer?: string;
     failureReason?: string;
-    nonce?: unknown;
-    expiresAt?: unknown;
-    expectedRevision?: unknown;
+    reasonCode?: string;
+    privateNote?: string;
+    supersededByProposalId?: string;
   };
 
   if (!proposalId || !status) {
@@ -423,31 +491,12 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
     return errorResponse(`Invalid status: ${status}`, 400);
   }
 
-  if (nonce !== undefined || expiresAt !== undefined) {
-    const windowResult = validateSignedWindow(nonce, expiresAt);
-    if (!windowResult.ok) {
-      const err = apiError(windowResult.code, windowResult.message, { field: windowResult.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
+  let validatedReasonCode: ProposalReviewReasonCode | undefined;
+  if (reasonCode !== undefined) {
+    if (!isProposalReviewReasonCode(reasonCode)) {
+      return errorResponse(`Invalid reasonCode: ${reasonCode}`, 400);
     }
-  }
-
-  if (expectedRevision !== undefined) {
-    const formatCheck = validateReviewRevision(expectedRevision);
-    if (!formatCheck.ok) {
-      const err = apiError(formatCheck.code, formatCheck.message, { field: formatCheck.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
-    const currentProposal = await getProposal(proposalId);
-    if (!currentProposal) {
-      const err = apiError("not_found", `Proposal not found: ${proposalId}`);
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
-    const currentRevision = getProposalRevision(currentProposal);
-    const revisionCheck = validateReviewRevision(expectedRevision, currentRevision);
-    if (!revisionCheck.ok) {
-      const err = apiError(revisionCheck.code, revisionCheck.message, { field: revisionCheck.field });
-      return NextResponse.json(err.body, { status: err.status, headers: err.headers });
-    }
+    validatedReasonCode = reasonCode;
   }
 
   try {
@@ -461,6 +510,24 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
         return NextResponse.json(err.body, { status: err.status, headers: err.headers });
       }
       return errorResponse("Proposal not found or invalid state transition", 409);
+    }
+    const decision = decisionForReviewStatus(status, { supersededByProposalId });
+    if (decision) {
+      const effectiveReasonCode =
+        validatedReasonCode ??
+        (status === "dependency_failed"
+          ? "DEPENDENCY_FAILED"
+          : status === "cancelled" && !supersededByProposalId
+            ? "CANCELLED_BY_OPERATOR"
+            : defaultReasonCodeForDecision(decision));
+      await recordProposalReviewDecision({
+        proposalId,
+        decision,
+        reasonCode: effectiveReasonCode,
+        supersededByProposalId: supersededByProposalId ?? null,
+        actorId: reviewer ?? null,
+        privateNote: privateNote ?? failureReason ?? null,
+      });
     }
     return json({ success: true, proposalId, status });
   } catch (err) {
