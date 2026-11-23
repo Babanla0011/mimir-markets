@@ -34,23 +34,25 @@ jobs:
         # fallback) — that is the fail-closed signal, surfaced by the next step.
         continue-on-error: true
         env:
-          # Pull requests must diff against the target branch. `event.before`
-          # is a push-only field and can point at the previous PR head on a
-          # synchronize event, which includes unrelated base-branch changes.
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          BEFORE: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          args=""
-          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
-            args="--base $BASE"
+          args=()
+          if [ "$EVENT_NAME" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            args=(--base "$BEFORE")
           fi
-          node scripts/ci/changed-paths.mjs $args
+          node scripts/ci/changed-paths.mjs "${args[@]}"
       - name: surface an undecidable change set
+        env:
+          PATHS_OUTCOME: ${{ steps.paths.outcome }}
+          TIERS_JSON: ${{ steps.paths.outputs.tiers_json }}
+          UNKNOWN: ${{ steps.paths.outputs.unknown }}
         run: |
-          if [ "${{ steps.paths.outcome }}" != "success" ]; then
+          if [ "$PATHS_OUTCOME" != "success" ]; then
             echo "::error::changed-paths could not determine the change set (see the step log above). The suites below run ALL tiers as the fail-closed fallback — do not merge until the trigger context is fixed."
             exit 1
           fi
-          echo "resolved change set; tiers_json=${{ steps.paths.outputs.tiers_json }} unknown=${{ steps.paths.outputs.unknown }}"
+          echo "resolved change set; tiers_json=$TIERS_JSON unknown=$UNKNOWN"
 
   # Tier suites. The union of all tiers equals the old single verify job; a
   # tier runs only when a path in its scope changed (or when the change set was

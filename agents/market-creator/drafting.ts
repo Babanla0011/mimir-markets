@@ -30,12 +30,12 @@ export interface ClaimCandidate {
   deadlineInterpretation?: DeadlineInterpretation;
   category?: string;
   threshold?: number;
-  statementDigest?: string;
-  deduplicationId?: string;
-  creatorPosition?: string;
-  counterPosition?: string;
-  settlementRule?: string;
-  qualityScore?: number;
+  /** Source snapshot identity the candidate was drafted from. */
+  sourceId?: string;
+  /** Capture version of the source snapshot the candidate was drafted from. */
+  captureVersion?: string;
+  /** Snapshot version used by the shared candidate signature helper. */
+  sourceVersion?: string;
   [key: string]: unknown;
 }
 
@@ -1069,39 +1069,47 @@ export function buildDraftingPrompt(context: DraftingContext): string {
   ].filter(Boolean).join("\n\n");
 }
 
-/**
- * Parse the LLM response into candidates. Tolerates code fences and
- * surrounding prose. Normalizes each candidate's deadline to a canonical
- * UTC timestamp with `sourceZone` and `deadlineInterpretation` retained as
- * metadata, and drops candidates with ambiguous local-only or invalid deadlines.
- * Returns [] on any parsing failure - the caller treats that as "no candidates this run".
- */
-export function parseDraftedCandidates(raw: string): ClaimCandidate[] {
-  if (!raw) return [];
+export interface DraftedCandidateResult {
+  index: number;
+  /** Retained even when another required field is missing. */
+  statement: string | null;
+  candidate: ClaimCandidate | null;
+  rejectionReason: "invalid_candidate" | null;
+}
+
+export interface DraftedCandidateBatch {
+  entries: DraftedCandidateResult[];
+  error: "invalid_draft_response" | null;
+}
+
+/** Inspect each draft before filters discard it, for offline batch reports. */
+export function parseDraftedCandidateBatch(raw: string): DraftedCandidateBatch {
+  const invalid = (): DraftedCandidateBatch => ({ entries: [], error: "invalid_draft_response" });
+  if (!raw) return invalid();
   const trimmed = raw.trim();
   const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*)```/i);
   const jsonText = fenceMatch ? fenceMatch[1] : trimmed;
 
   const start = jsonText.indexOf("[");
   const end = jsonText.lastIndexOf("]");
-  if (start < 0 || end <= start) return [];
+  if (start < 0 || end <= start) return invalid();
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText.slice(start, end + 1));
   } catch {
-    return [];
+    return invalid();
   }
-  if (!Array.isArray(parsed)) return [];
+  if (!Array.isArray(parsed)) return invalid();
 
-  const out: ClaimCandidate[] = [];
-  for (const item of parsed) {
-    if (!item || typeof item !== "object") continue;
-    const rec = item as Record<string, unknown>;
+  const entries = parsed.map((item, index): DraftedCandidateResult => {
+    const rec = item && typeof item === "object" ? item as Record<string, unknown> : {};
     const question = typeof rec.question === "string" ? rec.question.trim() : "";
     const resolutionUrl = typeof rec.resolutionUrl === "string" ? rec.resolutionUrl.trim() : "";
     const deadline = typeof rec.deadline === "string" ? rec.deadline.trim() : "";
-    if (!question || !resolutionUrl || !deadline) continue;
+    if (!question || !resolutionUrl || !deadline) {
+      return { index, statement: question || null, candidate: null, rejectionReason: "invalid_candidate" };
+    }
     const candidate: ClaimCandidate = {
       question,
       resolutionUrl,
@@ -1110,16 +1118,21 @@ export function parseDraftedCandidates(raw: string): ClaimCandidate[] {
       deadlineInterpretation: interpreted,
       category: typeof rec.category === "string" ? rec.category : undefined,
       threshold: typeof rec.threshold === "number" ? rec.threshold : undefined,
-      creatorPosition: typeof rec.creatorPosition === "string" ? rec.creatorPosition : undefined,
-      counterPosition: typeof rec.counterPosition === "string" ? rec.counterPosition : undefined,
-      settlementRule: typeof rec.settlementRule === "string" ? rec.settlementRule : undefined,
-      qualityScore: typeof rec.qualityScore === "number" ? rec.qualityScore : undefined,
+      ...(typeof rec.sourceId === "string" ? { sourceId: rec.sourceId } : {}),
+      ...(typeof rec.sourceVersion === "string" ? { sourceVersion: rec.sourceVersion } : {}),
+      ...(typeof rec.captureVersion === "string" ? { captureVersion: rec.captureVersion } : {}),
     };
-    candidate.statementDigest = computeStatementDigest(candidate);
-    candidate.deduplicationId = buildDeduplicationIdentity(candidate);
-    out.push(candidate);
-  }
-  return out;
+    return { index, statement: question, candidate, rejectionReason: null };
+  });
+  return { entries, error: null };
+}
+
+/**
+ * Parse candidates, tolerating code fences and surrounding prose.
+ * Compatibility API: malformed responses/entries still produce no candidate.
+ */
+export function parseDraftedCandidates(raw: string): ClaimCandidate[] {
+  return parseDraftedCandidateBatch(raw).entries.flatMap(({ candidate }) => candidate ? [candidate] : []);
 }
 
 /**
@@ -1303,12 +1316,4 @@ export async function draftClaimCandidatesWithRetry(
  * Exported for tests and for callers that want to inspect threshold
  * mentions in a drafted question without running the full filter.
  */
-export {
-  extractUsdThresholds,
-  cryptoThresholdReason,
-  computeStatementDigest,
-  buildDeduplicationIdentity,
-  reconcileSubmission,
-  type MarketCreationIntent,
-  type ReconciliationResult,
-};
+export { extractUsdThresholds, cryptoThresholdReason };
