@@ -25,10 +25,7 @@ use crate::escrow;
 use crate::events;
 use crate::fees;
 use crate::storage;
-use crate::types::{
-    Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason,
-    TransitionKind, Verdict, WinnerSide,
-};
+use crate::types::{Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason, Verdict, WinnerSide};
 use crate::util;
 
 /// Return the currently approved oracle resolution and claim expiration policy

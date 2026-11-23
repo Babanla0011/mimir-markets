@@ -11,9 +11,9 @@ use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeeClassLiability,
-    FeeLiabilitySummary, FeePolicy, FeeRecipientClass, MarketConfig, PayoutQuote,
-    PendingFeePolicy, PendingOracle, PlatformStats, Verdict, WinnerSide, MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, CreateParams, Error, FeePolicy,
+    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
+    WinnerSide, VersionedPayoutQuote, MAX_BATCH_SIZE,
 };
 
 #[contract]
@@ -238,35 +238,7 @@ impl MimirMarket {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        let (ids, total) = storage::get_creator_claims(&env, &creator, offset, limit);
-        Ok((ids, total.min(u32::MAX as u64) as u32))
-    }
-
-    /// One bounded page of a claim's transition history (#781), oldest first.
-    ///
-    /// Each transition carries its stable identity `(claim_id, seq)`; `seq`
-    /// starts at 1 and is never reused, so a reference stays valid as new
-    /// transitions are appended. Returns transitions with `seq > cursor`
-    /// (`cursor = 0` for the first page; then the previous `next_cursor`).
-    ///
-    /// Bounded: at most `MAX_HISTORY_PAGE_SIZE` (50) entries per call;
-    /// `limit = 0` means that maximum and a larger `limit` is refused with
-    /// `Error::HistoryPageTooLarge` before any storage read. The read opens one
-    /// entry per returned transition plus the claim's history head and never
-    /// the challenger roster, so its cost is O(page), not O(challengers).
-    ///
-    /// Incomplete history is explicit: `next_cursor` is `Some` while later
-    /// transitions exist, `from_genesis == false` means transitions before
-    /// seq 1 were never recorded on chain (claim predates history tracking),
-    /// and `missing_seq` names an archived entry the page stopped at.
-    /// Unknown claim ids return `Error::ClaimNotFound`.
-    pub fn get_claim_history(
-        env: Env,
-        claim_id: u64,
-        cursor: u32,
-        limit: u32,
-    ) -> Result<ClaimHistoryPage, Error> {
-        claim_history::get_page(&env, claim_id, cursor, limit)
+        Ok(claims::get_creator_claims(&env, creator, offset, limit))
     }
 
     /// The claim's verdict with its explicit encoding version.
@@ -423,6 +395,39 @@ impl MimirMarket {
         challenger: Address,
     ) -> Result<PayoutQuote, Error> {
         resolve::quote_challenger_payout(&env, claim_id, &challenger)
+    }
+
+    /// Read the current arithmetic policy without reading any claim or wallet.
+    pub fn rounding_policy_version(env: Env) -> u32 {
+        let _ = env;
+        fees::ROUNDING_POLICY_VERSION
+    }
+
+    /// Preview a payout only under the caller's explicitly required policy.
+    /// Unsupported versions are refused before reading the claim or roster.
+    pub fn quote_payout_versioned(
+        env: Env,
+        claim_id: u64,
+        challenger: Address,
+        required_version: u32,
+    ) -> Result<VersionedPayoutQuote, Error> {
+        fees::require_rounding_policy_version(required_version)?;
+        Ok(VersionedPayoutQuote {
+            rounding_policy_version: fees::ROUNDING_POLICY_VERSION,
+            quote: resolve::quote_challenger_payout(&env, claim_id, &challenger)?,
+        })
+    }
+
+    /// Pull once using the same policy as a versioned preview. This retains the
+    /// legacy payout's authorization, fee accrual, dust and frozen-token fallback.
+    pub fn claim_payout_versioned(
+        env: Env,
+        challenger: Address,
+        claim_id: u64,
+        required_version: u32,
+    ) -> Result<i128, Error> {
+        fees::require_rounding_policy_version(required_version)?;
+        resolve::claim_challenger_payout(&env, challenger, claim_id)
     }
 
     pub fn get_platform_stats(env: Env) -> Result<PlatformStats, Error> {

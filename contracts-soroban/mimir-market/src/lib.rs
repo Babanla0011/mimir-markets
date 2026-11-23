@@ -8,14 +8,13 @@
 ///
 /// Deliberate deviations from the Solidity original are marked
 /// `DEVIATION FROM SOLIDITY` at the point they occur.
-
 mod admin;
 mod claim_history;
 mod claims;
-mod contract;
+pub mod contract;
 mod escrow;
-mod fees;
 pub mod events;
+mod fees;
 mod resolve;
 mod storage;
 mod types;
@@ -29,6 +28,10 @@ pub use contract::{MimirMarket, MimirMarketClient};
 pub use types::*;
 
 #[cfg(test)]
+mod test_batch_get_claims;
+#[cfg(test)]
+mod test_batch_read;
+#[cfg(test)]
 mod test_challenge_lock;
 #[cfg(test)]
 mod test_common;
@@ -41,18 +44,18 @@ mod test_fee_rounding;
 #[cfg(test)]
 mod test_fees;
 #[cfg(test)]
+mod test_fee_recipient_transition;
+#[cfg(test)]
 mod test_lifecycle;
 #[cfg(test)]
 mod test_pagination;
 #[cfg(test)]
-mod test_settlement;
-#[cfg(test)]
-mod test_verdict;
-#[cfg(test)]
-mod test_batch_read;
-#[cfg(test)]
-mod test_batch_get_claims;
+mod test_preflight;
 #[cfg(test)]
 mod test_rematch_status;
 #[cfg(test)]
-mod test_fee_liabilities;
+mod test_rounding_policy;
+#[cfg(test)]
+mod test_settlement;
+#[cfg(test)]
+mod test_verdict;
