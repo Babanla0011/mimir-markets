@@ -159,6 +159,12 @@ export interface VoteAttemptInput {
   ageMs?: number;
   /** Responses older than this are stale (optional). */
   maxAgeMs?: number;
+  /**
+   * Optional arrival/delivery identity for this vote attempt (e.g. request id,
+   * trace id, or receipt id). Preserved on the accepted ballot entry so
+   * deduplicated retries reference the original arrival identity.
+   */
+  arrivalId?: string;
 }
 
 export interface ClassifiedVote {
@@ -169,122 +175,29 @@ export interface ClassifiedVote {
   confidence?: number;
   /** True when disposition is valid and verdict is CREATOR_WINS or CHALLENGERS_WIN. */
   decisive: boolean;
-  /** Optional bound participant wallet/account address. */
-  participantAddress?: string;
-  /** Optional normalized claim revision carried by this vote. */
-  claimRevision?: string;
-  /** Optional epoch ms when this vote was recorded. */
-  recordedAtMs?: number;
-  /** Optional epoch ms when this vote was altered. */
-  alteredAtMs?: number;
-}
-
-export interface CommittedBallotVote {
-  readonly slug: string;
-  readonly participantAddress?: string;
-  readonly verdict: Verdict;
-  readonly confidence: number;
-  readonly decisive: boolean;
-  readonly recordedAtMs?: number;
-}
-
-export interface CouncilBallotCommitment {
-  readonly version: number;
-  readonly claimId: number;
-  readonly claimRevision: string;
-  readonly votingBoundaryMs: number | null;
-  readonly eligibleVoteSet: readonly string[];
-  readonly participantIdentities: readonly BallotParticipantIdentity[];
-  readonly ballot: readonly CommittedBallotVote[];
-  /** 64-character lowercase hex SHA-256 digest over the canonical commitment bytes. */
-  readonly commitmentHash: string;
-  /** Alias for {@link commitmentHash}. */
-  readonly digest: string;
-}
-
-export type BallotCommitmentFailureReason =
-  | "invalid_version"
-  | "invalid_claim_id"
-  | "invalid_claim_revision"
-  | "claim_revision_mismatch"
-  | "invalid_eligible_vote_set"
-  | "eligible_vote_set_mismatch"
-  | "ineligible_voter"
-  | "invalid_participant_identity"
-  | "participant_identity_mismatch"
-  | "invalid_voting_boundary"
-  | "recorded_after_boundary"
-  | "altered_after_boundary"
-  | "ballot_altered"
-  | "digest_mismatch";
-
-export class BallotCommitmentError extends Error {
-  constructor(
-    readonly reason: BallotCommitmentFailureReason,
-    message: string,
-  ) {
-    super(message);
-    this.name = "BallotCommitmentError";
-  }
-}
-
-export interface BallotCommitmentInput {
-  /** Schema version (defaults to {@link COUNCIL_BALLOT_COMMITMENT_VERSION}). */
-  version?: number;
-  /** Settling claim id (positive integer). */
-  claimId: number;
-  /** Claim revision identifier or number bound at the voting boundary. */
-  claimRevision: number | string;
-  /** Approved set of eligible voter slugs for this claim settlement pass. */
-  eligibleVoteSet?: readonly string[];
-  /** Alias for {@link eligibleVoteSet}. */
-  eligibleSlugs?: readonly string[];
+  /** Arrival/delivery identity of this vote attempt, when supplied. */
+  arrivalId?: string;
   /**
-   * Participant identities bound into the commitment.
-   * When omitted, derived from `eligibleVoteSet` and any addresses present on the votes.
+   * For `duplicated` votes, the arrival identity of the original accepted
+   * vote for the same persona slug, when known.
    */
-  participantIdentities?: readonly BallotParticipantInput[];
-  /** Alias for {@link participantIdentities}. */
-  participants?: readonly BallotParticipantInput[];
-  /** Approved voting boundary cutoff (epoch ms), when enforced. */
-  votingBoundaryMs?: number | null;
-  /** Classified vote attempts or built ballot captured at the voting boundary. */
-  votes?: readonly ClassifiedVote[];
-  /** Alias for {@link votes}. */
-  ballot?: readonly ClassifiedVote[];
+  originalArrivalId?: string;
+  /**
+   * For `duplicated` votes, true when the duplicate disagreed with the
+   * original accepted vote's verdict or confidence.
+   */
+  conflict?: boolean;
 }
 
-export interface BallotCommitmentVerifyContext {
-  claimId?: number;
-  claimRevision?: number | string;
-  eligibleVoteSet?: readonly string[];
-  participantIdentities?: readonly BallotParticipantInput[];
-  votingBoundaryMs?: number | null;
-}
-
-export interface BallotCommitmentVerification {
-  ok: boolean;
-  reason?: BallotCommitmentFailureReason;
-  detail: string;
-  commitmentHash?: string;
-  expectedHash?: string;
-}
-
-export interface QuorumEvaluationOptions {
-  claimState?: ClaimSettleState;
-  strictConfig?: boolean;
-  /** Pre-sealed ballot commitment verified before outcome evaluation. */
-  commitment?: CouncilBallotCommitment;
-  /** Expected claim id verified against `commitment` or used to seal one. */
-  claimId?: number;
-  /** Expected claim revision verified before outcome evaluation. */
-  claimRevision?: number | string;
-  /** Approved eligible voter slugs verified before outcome evaluation. */
-  eligibleVoteSet?: readonly string[];
-  /** Bound participant identities verified before outcome evaluation. */
-  participantIdentities?: readonly BallotParticipantInput[];
-  /** Approved voting boundary cutoff (epoch ms); ballots altered after this are rejected. */
-  votingBoundaryMs?: number;
+export interface DuplicateVoteConflict {
+  slug: string;
+  originalArrivalId?: string;
+  duplicateArrivalId?: string;
+  originalVerdict?: Verdict;
+  duplicateVerdict?: Verdict;
+  originalConfidence?: number;
+  duplicateConfidence?: number;
+  reason: string;
 }
 
 export interface QuorumEvaluation {
@@ -299,12 +212,8 @@ export interface QuorumEvaluation {
   acceptedSlugs: string[];
   /** Valid votes in ballot order (duplicates / rejects excluded). */
   ballot: ClassifiedVote[];
-  /** Present when a versioned council ballot commitment was verified or sealed. */
-  commitment?: CouncilBallotCommitment;
-  /** True when commitment verification passed; false when rejected. */
-  commitmentValid?: boolean;
-  /** Typed failure reason when `action === "abort_invalid_commitment"`. */
-  commitmentFailureReason?: BallotCommitmentFailureReason;
+  /** Explicit inconsistencies where a duplicate vote conflicted with the original accepted vote. */
+  conflicts: DuplicateVoteConflict[];
 }
 
 const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
@@ -463,52 +372,48 @@ function attachVoteMetadata(base: ClassifiedVote, input: VoteAttemptInput): Clas
  */
 export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
   const slug = (input.slug ?? "").trim().toLowerCase();
+  const arrivalId =
+    typeof input.arrivalId === "string" ? input.arrivalId.trim() || undefined : undefined;
+  const arrivalMeta = arrivalId ? { arrivalId } : {};
+
   if (!slug) {
-    return attachVoteMetadata(
-      {
-        slug: "",
-        disposition: "invalid",
-        reason: "missing persona slug",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug: "",
+      disposition: "invalid",
+      reason: "missing persona slug",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (input.personaPaused) {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "paused",
-        reason: "persona is paused",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "paused",
+      reason: "persona is paused",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (input.claimState === "cancelled") {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "cancelled",
-        reason: "claim is cancelled on-chain",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "cancelled",
+      reason: "claim is cancelled on-chain",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (input.claimState === "resolved") {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "stale",
-        reason: "claim is already resolved",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "stale",
+      reason: "claim is already resolved",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (
@@ -517,90 +422,13 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     !Number.isInteger(input.claimId) ||
     input.claimId !== input.expectedClaimId
   ) {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "stale",
-        reason: `vote claimId ${input.claimId} does not match settling claim ${input.expectedClaimId}`,
-        decisive: false,
-      },
-      input,
-    );
-  }
-
-  if (input.expectedClaimRevision !== undefined) {
-    const expectedRev = normalizeRevisionString(input.expectedClaimRevision);
-    const actualRev = normalizeRevisionString(input.claimRevision);
-    if (!expectedRev || !actualRev || actualRev !== expectedRev) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "stale",
-          reason: `vote claimRevision ${String(input.claimRevision)} does not match settling revision ${String(input.expectedClaimRevision)}`,
-          decisive: false,
-        },
-        input,
-      );
-    }
-  }
-
-  if (input.eligibleVoteSet !== undefined) {
-    const eligible = new Set(
-      input.eligibleVoteSet.map((s) => (typeof s === "string" ? s.trim().toLowerCase() : "")).filter(Boolean),
-    );
-    if (!eligible.has(slug)) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "invalid",
-          reason: `persona '${slug}' is not in the eligible vote set`,
-          decisive: false,
-        },
-        input,
-      );
-    }
-  }
-
-  if (input.votingBoundaryMs !== undefined) {
-    if (!Number.isFinite(input.votingBoundaryMs) || input.votingBoundaryMs < 0) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "invalid",
-          reason: `invalid votingBoundaryMs ${String(input.votingBoundaryMs)}`,
-          decisive: false,
-        },
-        input,
-      );
-    }
-    if (
-      input.alteredAtMs !== undefined &&
-      (!Number.isFinite(input.alteredAtMs) || input.alteredAtMs > input.votingBoundaryMs)
-    ) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "invalid",
-          reason: `vote altered at ${String(input.alteredAtMs)}ms after approved voting boundary ${input.votingBoundaryMs}ms`,
-          decisive: false,
-        },
-        input,
-      );
-    }
-    if (
-      input.recordedAtMs !== undefined &&
-      (!Number.isFinite(input.recordedAtMs) || input.recordedAtMs > input.votingBoundaryMs)
-    ) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "stale",
-          reason: `vote recorded at ${String(input.recordedAtMs)}ms after approved voting boundary ${input.votingBoundaryMs}ms`,
-          decisive: false,
-        },
-        input,
-      );
-    }
+    return {
+      slug,
+      disposition: "stale",
+      reason: `vote claimId ${input.claimId} does not match settling claim ${input.expectedClaimId}`,
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (
@@ -611,27 +439,23 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     Number.isFinite(input.ageMs) &&
     input.ageMs > input.maxAgeMs
   ) {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "stale",
-        reason: `vote age ${input.ageMs}ms exceeds maxAgeMs ${input.maxAgeMs}`,
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "stale",
+      reason: `vote age ${input.ageMs}ms exceeds maxAgeMs ${input.maxAgeMs}`,
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (input.status === "network_error" || input.status === "timeout") {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "dependency_failure",
-        reason: input.status === "timeout" ? "vote request timed out" : "vote request network failure",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "dependency_failure",
+      reason: input.status === "timeout" ? "vote request timed out" : "vote request network failure",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (input.status === "http_error") {
@@ -639,97 +463,117 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
     // 5xx / 502-style upstream failures are dependency problems; 4xx are invalid
     // requests or persona/policy refusals — not something retrying the roster fixes.
     if (code >= 500 || code === 0) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "dependency_failure",
-          reason: `vote endpoint HTTP ${code || "error"}`,
-          decisive: false,
-        },
-        input,
-      );
+      return {
+        slug,
+        disposition: "dependency_failure",
+        reason: `vote endpoint HTTP ${code || "error"}`,
+        decisive: false,
+        ...arrivalMeta,
+      };
     }
     if (code === 404) {
-      return attachVoteMetadata(
-        {
-          slug,
-          disposition: "stale",
-          reason: "claim not found at vote endpoint",
-          decisive: false,
-        },
-        input,
-      );
-    }
-    return attachVoteMetadata(
-      {
+      return {
         slug,
-        disposition: "invalid",
-        reason: `vote endpoint HTTP ${code}`,
+        disposition: "stale",
+        reason: "claim not found at vote endpoint",
         decisive: false,
-      },
-      input,
-    );
+        ...arrivalMeta,
+      };
+    }
+    return {
+      slug,
+      disposition: "invalid",
+      reason: `vote endpoint HTTP ${code}`,
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   if (!isVerdict(input.verdict)) {
-    return attachVoteMetadata(
-      {
-        slug,
-        disposition: "invalid",
-        reason: "missing or unknown verdict",
-        decisive: false,
-      },
-      input,
-    );
+    return {
+      slug,
+      disposition: "invalid",
+      reason: "missing or unknown verdict",
+      decisive: false,
+      ...arrivalMeta,
+    };
   }
 
   const confidence = clampConfidence(input.confidence);
-  return attachVoteMetadata(
-    {
-      slug,
-      disposition: "valid",
-      reason: "accepted",
-      verdict: input.verdict,
-      confidence,
-      decisive: isDecisiveVerdict(input.verdict),
-    },
-    input,
-  );
+  return {
+    slug,
+    disposition: "valid",
+    reason: "accepted",
+    verdict: input.verdict,
+    confidence,
+    decisive: isDecisiveVerdict(input.verdict),
+    ...arrivalMeta,
+  };
 }
 
 /**
- * Fold classified attempts into a ballot: first valid vote per slug wins;
- * later attempts for the same slug are marked duplicated and dropped.
+ * Fold classified attempts into a ballot: first valid vote per slug wins and
+ * its original arrival identity is preserved.
+ *
+ * - Identical retries (same verdict and confidence) are deduplicated
+ *   idempotently and reference the original arrival identity.
+ * - Conflicting duplicates (different verdict or confidence) are rejected as
+ *   duplicated and surfaced as explicit inconsistencies in `conflicts`.
  */
 export function buildBallot(classified: ClassifiedVote[]): {
   ballot: ClassifiedVote[];
   rejected: ClassifiedVote[];
+  conflicts: DuplicateVoteConflict[];
 } {
-  const seen = new Set<string>();
+  const acceptedBySlug = new Map<string, ClassifiedVote>();
   const ballot: ClassifiedVote[] = [];
   const rejected: ClassifiedVote[] = [];
+  const conflicts: DuplicateVoteConflict[] = [];
 
   for (const vote of classified) {
     if (vote.disposition !== "valid") {
       rejected.push(vote);
       continue;
     }
-    if (seen.has(vote.slug)) {
+    const original = acceptedBySlug.get(vote.slug);
+    if (original) {
+      const isConflict =
+        vote.verdict !== original.verdict || vote.confidence !== original.confidence;
+      const originalRef = original.arrivalId ? ` (arrival '${original.arrivalId}')` : "";
+      const reason = isConflict
+        ? `conflicting duplicate vote for persona '${vote.slug}': original ${original.verdict}(${original.confidence})${originalRef} vs duplicate ${vote.verdict}(${vote.confidence})${vote.arrivalId ? ` (arrival '${vote.arrivalId}')` : ""}`
+        : `duplicate vote for persona '${vote.slug}' (idempotent retry${original.arrivalId ? ` of arrival '${original.arrivalId}'` : ""})`;
+
+      if (isConflict) {
+        conflicts.push({
+          slug: vote.slug,
+          ...(original.arrivalId ? { originalArrivalId: original.arrivalId } : {}),
+          ...(vote.arrivalId ? { duplicateArrivalId: vote.arrivalId } : {}),
+          originalVerdict: original.verdict,
+          duplicateVerdict: vote.verdict,
+          originalConfidence: original.confidence,
+          duplicateConfidence: vote.confidence,
+          reason,
+        });
+      }
+
       rejected.push({
         ...vote,
         disposition: "duplicated",
-        reason: `duplicate vote for persona '${vote.slug}'`,
+        reason,
         decisive: false,
         verdict: undefined,
         confidence: undefined,
+        ...(original.arrivalId ? { originalArrivalId: original.arrivalId } : {}),
+        conflict: isConflict,
       });
       continue;
     }
-    seen.add(vote.slug);
+    acceptedBySlug.set(vote.slug, vote);
     ballot.push(vote);
   }
 
-  return { ballot, rejected };
+  return { ballot, rejected, conflicts };
 }
 
 function countDispositions(
@@ -1488,6 +1332,7 @@ export function evaluateQuorum(
       reason: "claim is cancelled — council settlement aborted",
       acceptedSlugs: [],
       ballot: [],
+      conflicts: [],
     };
   }
 
@@ -1502,6 +1347,7 @@ export function evaluateQuorum(
       reason: "claim is already resolved — council pass is stale",
       acceptedSlugs: [],
       ballot: [],
+      conflicts: [],
     };
   }
 
@@ -1516,6 +1362,7 @@ export function evaluateQuorum(
       reason: "claim is paused — council settlement aborted",
       acceptedSlugs: [],
       ballot: [],
+      conflicts: [],
     };
   }
 
@@ -1530,83 +1377,12 @@ export function evaluateQuorum(
       reason: `invalid COUNCIL_QUORUM value: ${String(quorumRaw)}`,
       acceptedSlugs: [],
       ballot: [],
+      conflicts: [],
     };
   }
 
-  // Verify or seal the versioned council ballot commitment BEFORE outcome evaluation.
-  let verifiedCommitment: CouncilBallotCommitment | undefined;
-  const hasCommitmentContext =
-    opts?.commitment !== undefined ||
-    opts?.votingBoundaryMs !== undefined ||
-    opts?.eligibleVoteSet !== undefined ||
-    opts?.claimRevision !== undefined ||
-    opts?.participantIdentities !== undefined;
-
-  if (opts?.commitment !== undefined) {
-    const verification = verifyBallotCommitment(opts.commitment, attempts, {
-      claimId: opts.claimId,
-      claimRevision: opts.claimRevision,
-      eligibleVoteSet: opts.eligibleVoteSet,
-      participantIdentities: opts.participantIdentities,
-      votingBoundaryMs: opts.votingBoundaryMs,
-    });
-    if (!verification.ok) {
-      return {
-        action: "abort_invalid_commitment",
-        quorum,
-        policyRevision,
-        decisiveCount: 0,
-        acceptedCount: 0,
-        dispositions: countDispositions(attempts),
-        reason: `ballot commitment rejected (${verification.reason ?? "ballot_altered"}): ${verification.detail}`,
-        acceptedSlugs: [],
-        ballot: [],
-        commitment: opts.commitment,
-        commitmentValid: false,
-        commitmentFailureReason: verification.reason ?? "ballot_altered",
-      };
-    }
-    verifiedCommitment = opts.commitment;
-  } else if (hasCommitmentContext) {
-    try {
-      const derivedEligible =
-        opts?.eligibleVoteSet ??
-        Array.from(
-          new Set(
-            attempts
-              .map((a) => (a.slug ?? "").trim().toLowerCase())
-              .filter(Boolean),
-          ),
-        );
-      verifiedCommitment = createBallotCommitment({
-        claimId: opts?.claimId ?? 1,
-        claimRevision: opts?.claimRevision ?? 1,
-        eligibleVoteSet: derivedEligible.length > 0 ? derivedEligible : ["__none__"],
-        participantIdentities: opts?.participantIdentities,
-        votingBoundaryMs: opts?.votingBoundaryMs,
-        votes: attempts,
-      });
-    } catch (err) {
-      const failureReason: BallotCommitmentFailureReason =
-        err instanceof BallotCommitmentError ? err.reason : "ballot_altered";
-      const detail = err instanceof Error ? err.message : "invalid ballot commitment";
-      return {
-        action: "abort_invalid_commitment",
-        quorum,
-        policyRevision,
-        decisiveCount: 0,
-        acceptedCount: 0,
-        dispositions: countDispositions(attempts),
-        reason: `ballot commitment rejected (${failureReason}): ${detail}`,
-        acceptedSlugs: [],
-        ballot: [],
-        commitmentValid: false,
-        commitmentFailureReason: failureReason,
-      };
-    }
-  }
-
-  const { ballot, rejected } = buildBallot(attempts);
+  const quorum = normalizeQuorum(quorumRaw);
+  const { ballot, rejected, conflicts } = buildBallot(attempts);
   const all = [...ballot, ...rejected];
   const dispositions = countDispositions(all);
   const decisive = ballot.filter((v) => v.decisive);
@@ -1628,7 +1404,7 @@ export function evaluateQuorum(
       reason: `quorum met: ${decisiveCount}/${quorum} decisive votes`,
       acceptedSlugs,
       ballot,
-      ...commitmentProps,
+      conflicts,
     };
   }
 
@@ -1654,6 +1430,6 @@ export function evaluateQuorum(
     reason: reasonParts.join("; "),
     acceptedSlugs,
     ballot,
-    ...commitmentProps,
+    conflicts,
   };
 }
