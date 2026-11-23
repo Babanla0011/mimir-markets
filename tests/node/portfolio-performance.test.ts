@@ -2,13 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyLiveRefreshToSnapshots,
-  comparePortfolioSnapshots,
-  freezePortfolioSnapshot,
+  formatTrustedLedger,
+  isPerformanceObservationCoverage,
   isPortfolioPerformanceResponse,
-  isPortfolioSnapshot,
-  isPortfolioSnapshotComparison,
-  type PortfolioSnapshot,
+  normalizeMissingIntervals,
+  parseTrustedLedger,
+  splitPointsByMissingIntervals,
 } from "../../lib/portfolio-performance";
 
 const CACHE = {

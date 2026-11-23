@@ -3,13 +3,14 @@
 /**
  * One line chart for both agent P&amp;L and basket NAV.
  *
- * Inline SVG rather than a charting library: this is a path, a baseline and a
- * hover readout — a chart dependency would ship more JavaScript than the rest of
- * the page. Colours come from theme tokens so it inverts with the palette.
+ * Inline SVG rather than a charting library: this is a path, a baseline,
+ * observation-coverage overlays, and a hover readout — a chart dependency would
+ * ship more JavaScript than the rest of the page. Colours come from theme tokens
+ * so it inverts with the palette.
  *
- * The line draws itself on mount via stroke-dasharray, which animates on the
- * compositor rather than by re-rendering React on every frame. Anyone who asked
- * their system not to animate gets the finished line immediately.
+ * Missing observation intervals are rendered as hatched gap bands and break the
+ * series line so unobserved periods are visually distinct from verified zero
+ * performance.
  *
  * Keyboard and screen-reader users can't hover, so the chart is also focusable:
  * ArrowLeft/ArrowRight move between observations (Home/End jump to the ends),
@@ -24,16 +25,12 @@
 import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from "react";
 
 import {
-  PORTFOLIO_CHART_RANGES,
-  buildPerformanceChartRows,
-  formatChartDay,
-  MAX_TABLE_ROWS,
-} from "@/lib/performance-chart-rows";
-import {
-  verifyPortfolioPerformanceManifest,
-  type PortfolioPerformanceStatementManifest,
+  formatTrustedLedger,
+  normalizeMissingIntervals,
+  splitPointsByMissingIntervals,
+  type PerformanceMissingInterval,
+  type PerformanceObservationCoverage,
 } from "@/lib/portfolio-performance";
-import { formatAtomicUsdc } from "@/lib/usdc";
 
 export interface ChartPoint {
   timestamp: number;
@@ -56,33 +53,23 @@ const VIEW_WIDTH = 720;
 const VIEW_HEIGHT = 180;
 const PAD_X = 10;
 const PAD_Y = 14;
+const MAX_TABLE_ROWS = 50;
 
-const RANGE_LABELS: Record<PortfolioChartRange, string> = {
-  "24h": "24h",
-  "7d": "7d",
-  "30d": "30d",
-  all: "All",
-};
+function formatDay(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
 
-export interface PerformanceChartProps {
-  points?: ChartPoint[];
-  series?: ChartSeries[];
-  /** The line drawn as "flat": starting NAV, or zero for cumulative P&L. */
-  baseline: number;
-  label: string;
-  valueSuffix?: string;
-  emptyMessage?: string;
-  invalidMessage?: string;
-  height?: number;
-  /** Initial or controlled chart range */
-  range?: PortfolioChartRange;
-  timeBounds?: TimeBounds;
-  /** Callback fired when the user selects a range */
-  onRangeChange?: (range: PortfolioChartRange, bounds?: TimeBounds) => void;
-  /** Whether to sync selected chart range with normalized URL state (default: true) */
-  syncUrl?: boolean;
-  /** Show range selection buttons (default: true) */
-  showRangeControls?: boolean;
+function buildChartTableRows(points: readonly ChartPoint[], valueSuffix: string) {
+  const total = points.length;
+  const sliced = total > MAX_TABLE_ROWS ? points.slice(total - MAX_TABLE_ROWS) : points;
+  return {
+    rows: sliced.map((point) => ({
+      date: formatDay(point.timestamp),
+      value: `${point.value.toFixed(2)}${valueSuffix}`,
+    })),
+    total,
+    truncated: total > MAX_TABLE_ROWS,
+  };
 }
 
 function formatCoverage(coverage: ChartPoint["coverage"]): string {
@@ -102,7 +89,8 @@ export function PerformanceChart({
   emptyMessage = "No settled results in this window yet.",
   invalidMessage = "Performance data is unavailable.",
   height = 180,
-  statementManifest,
+  coverage,
+  stale = false,
 }: {
   points?: ChartPoint[];
   series?: ChartSeries[];
@@ -116,6 +104,7 @@ export function PerformanceChart({
   series?: ChartSeries[];
 }) {
   const gradientId = useId();
+  const gapPatternId = useId();
   const tableId = useId();
   const [drawn, setDrawn] = useState(false);
   const [hover, setHover] = useState<number | null>(null);
@@ -173,14 +162,11 @@ export function PerformanceChart({
   const geometry = useMemo(() => {
     if (effectiveState !== "available" || allSeries.length === 0) return null;
     const allPoints = allSeries.flatMap((s) => s.points);
-    const validNumericValues = allPoints
-      .map((p) => p.value)
-      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+    if (allPoints.length === 0) return null;
 
-    if (validNumericValues.length === 0) return null;
-
-    const min = Math.min(baseline, ...validNumericValues);
-    const max = Math.max(baseline, ...validNumericValues);
+    const values = allPoints.map((point) => point.value);
+    const min = Math.min(baseline, ...values);
+    const max = Math.max(baseline, ...values);
     // A flat series would divide by zero; give it a nominal band so it centres.
     const span = max - min || Math.max(1, Math.abs(max) * 0.02);
 
@@ -257,7 +243,9 @@ export function PerformanceChart({
     );
   }
 
-  if (!geometry || geometry.seriesGeoms.length === 0 || geometry.seriesGeoms[0].coords.length === 0) {
+  const hasCoverageBanner = Boolean(coverage) || stale;
+
+  if (!geometry) {
     return (
       <div className="border border-pv-ink/[0.1] bg-pv-surface/40 px-4 py-12 text-center text-sm text-pv-muted">
         {emptyMessage}
@@ -275,11 +263,73 @@ export function PerformanceChart({
   const up = last.value >= baseline;
   const stroke = allSeries[0].stroke ?? (up ? "rgb(var(--pv-accent))" : "rgb(var(--pv-danger))");
   const length = pathRef.current?.getTotalLength?.() ?? 2000;
-  const tablePoints = points ?? allSeries[0]?.points ?? [];
-  const table = buildPerformanceChartRows(tablePoints, valueSuffix);
+  const table = buildChartTableRows(allSeries[0]?.points ?? [], valueSuffix);
+
+  const moveFocus = (next: number) => {
+    const clamped = Math.max(0, Math.min(count - 1, next));
+    setFocusIndex(clamped);
+    setFocusTimestamp(primary.coords[clamped].timestamp);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent<SVGSVGElement>) => {
+    const current = focusIndex ?? defaultIndex;
+    switch (event.key) {
+      case "ArrowLeft":
+        event.preventDefault();
+        moveFocus(current - 1);
+        break;
+      case "ArrowRight":
+        event.preventDefault();
+        moveFocus(current + 1);
+        break;
+      case "Home":
+        event.preventDefault();
+        moveFocus(0);
+        break;
+      case "End":
+        event.preventDefault();
+        moveFocus(count - 1);
+        break;
+      default:
+        break;
+    }
+  };
+
+  const activeDescription = `${formatDay(activePoint.timestamp)}, value ${activePoint.value.toFixed(2)}${valueSuffix}, ${formatCoverage(activePoint.coverage)}, observation ${active + 1} of ${count}`;
 
   return (
-    <figure data-state="available" className="border border-pv-ink/[0.1] bg-pv-surface/40 p-3">
+    <figure className="border border-pv-ink/[0.1] bg-pv-surface/40 p-3">
+      {hasCoverageBanner ? (
+        <div
+          data-performance-coverage="true"
+          className="mb-2 flex flex-wrap items-center justify-between gap-2 border-b border-pv-ink/[0.08] pb-2 font-mono text-[10px] uppercase tracking-wider text-pv-muted"
+        >
+          <span>
+            {coverage
+              ? `Last trusted ledger ${formatTrustedLedger(coverage.lastTrustedLedger)}`
+              : "Observation coverage"}
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            {missingIntervals.length > 0 ? (
+              <span
+                data-missing-intervals={missingIntervals.length}
+                className="rounded-sm border border-pv-ink/[0.18] bg-pv-ink/[0.05] px-1.5 py-0.5 text-pv-text"
+              >
+                {missingIntervals.length} missing interval{missingIntervals.length === 1 ? "" : "s"} (gap ≠ 0.00{valueSuffix})
+              </span>
+            ) : null}
+            {stale ? (
+              <span
+                data-stale-data="true"
+                className="rounded-sm border border-pv-danger/40 bg-pv-danger/[0.08] px-1.5 py-0.5 text-pv-danger"
+              >
+                Stale data
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       <svg
         ref={svgRef}
         viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
@@ -304,7 +354,43 @@ export function PerformanceChart({
             <stop offset="0%" stopColor={stroke} stopOpacity="0.22" />
             <stop offset="100%" stopColor={stroke} stopOpacity="0" />
           </linearGradient>
+          <pattern
+            id={gapPatternId}
+            width="8"
+            height="8"
+            patternUnits="userSpaceOnUse"
+            patternTransform="rotate(45)"
+          >
+            <line
+              x1="0"
+              y1="0"
+              x2="0"
+              y2="8"
+              stroke="rgb(var(--pv-ink) / 0.22)"
+              strokeWidth="2"
+            />
+          </pattern>
         </defs>
+
+        {/* Missing-interval bands: hatched shading distinct from a verified zero line */}
+        {geometry.gapRects.map((gap, index) => (
+          <g key={`gap-${gap.interval.startTimestamp}-${gap.interval.endTimestamp}-${index}`} data-performance-gap="true">
+            <rect
+              x={gap.x}
+              y={PAD_Y}
+              width={gap.width}
+              height={VIEW_HEIGHT - PAD_Y * 2}
+              fill={`url(#${gapPatternId})`}
+              stroke="rgb(var(--pv-ink) / 0.24)"
+              strokeWidth="1"
+              strokeDasharray="2 2"
+            >
+              <title>
+                {`Missing observation interval: ${formatDay(gap.interval.startTimestamp)} to ${formatDay(gap.interval.endTimestamp)}${gap.interval.reason ? ` (${gap.interval.reason})` : ""}`}
+              </title>
+            </rect>
+          </g>
+        ))}
 
         <line
           x1={PAD_X}
@@ -439,6 +525,19 @@ export function PerformanceChart({
                 ))}
               </tbody>
             </table>
+            {missingIntervals.length > 0 && (
+              <div className="mt-2 border-t border-pv-ink/[0.1] pt-2 font-mono text-xs text-pv-muted">
+                <p className="font-semibold text-pv-text">Missing observation intervals (not zero):</p>
+                <ul className="mt-1 list-disc pl-4">
+                  {missingIntervals.map((interval, index) => (
+                    <li key={`table-gap-${interval.startTimestamp}-${index}`}>
+                      {formatDay(interval.startTimestamp)} to {formatDay(interval.endTimestamp)}
+                      {interval.reason ? ` — ${interval.reason}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {table.truncated && (
               <p className="mt-1 text-xs text-pv-muted">
                 Showing the last {table.rows.length} of {table.total} points.
