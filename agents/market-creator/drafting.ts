@@ -1,61 +1,22 @@
 /**
- * LLM drafting for market creator.
+ * LLM drafting and statement revision review for market creator.
  *
- * This module owns the prompt and the parsing of the model's response
- * into candidate objects, including explicit time-zone interpretation and
- * canonical UTC deadline normalization.
+ * This module owns:
+ * 1. The drafting prompt and response parsing for candidate markets.
+ * 2. The statement revision review step: binding approved wording, deadline,
+ *    and source commitment to a cryptographic SHA-256 digest.
+ * 3. Pre-signing verification: rejecting signing if any reviewed statement
+ *    field changed between review and on-chain submission.
  */
 
+import * as crypto from "node:crypto";
 import { extractUsdThresholds, cryptoThresholdReason } from "./thresholds.js";
-import { buildCandidateSignature } from "./dedupe.js";
 import {
-  bumpCategoryUsage,
-  checkCategoryCreatorCap,
-  normalizeCategory,
-  type CategoryCapPolicy,
-  type CategoryExposureBucket,
-} from "../../lib/market-creator/category-caps.js";
-import { checkCreatorExposureCap } from "../../lib/market-creator/exposure-caps.js";
-import type { CreatorDecisionCode } from "../../lib/market-creator/mode-matrix.js";
-
-export type { CreatorDecisionCode };
-
-export type DeadlineRejectionReason =
-  | "empty_deadline"
-  | "ambiguous_local_deadline"
-  | "ambiguous_timezone"
-  | "invalid_timezone"
-  | "timezone_offset_mismatch"
-  | "invalid_datetime";
-
-export interface DeadlineInterpretation {
-  /** Canonical UTC ISO-8601 timestamp (e.g. "2026-05-01T18:00:00.000Z"). */
-  canonicalUtc: string;
-  /** Source time-zone designator or IANA zone retained as metadata (e.g. "UTC", "+02:00", "America/New_York"). */
-  sourceZone: string;
-  /** Signed UTC offset in minutes at the interpreted deadline instant (e.g. 0, 120, -240). */
-  offsetMinutes: number;
-  /** Normalized ISO-8601 UTC offset string at the deadline instant (e.g. "+00:00", "+02:00", "-04:00"). */
-  utcOffset: string;
-  /** Original trimmed deadline value before canonical UTC normalization. */
-  rawDeadline: string;
-}
-
-export type DeadlineParseResult =
-  | {
-      ok: true;
-      canonicalUtc: string;
-      sourceZone: string;
-      offsetMinutes: number;
-      utcOffset: string;
-      rawDeadline: string;
-    }
-  | {
-      ok: false;
-      reason: DeadlineRejectionReason;
-      error: string;
-      rawDeadline: string;
-    };
+  canonicaliseResolutionSourceUrl,
+  canonicaliseStatementDeadline,
+  filterDuplicateCandidates,
+  hasInvalidTextEncoding,
+} from "./dedupe.js";
 
 export interface ClaimCandidate {
   question: string;
