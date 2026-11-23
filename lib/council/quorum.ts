@@ -28,6 +28,26 @@
 
 import { createHash } from "node:crypto";
 import { isVerdict, type Verdict } from "../verdict";
+import {
+  evaluateQuorumIndependence,
+  type QuorumIndependenceEvaluation,
+  type QuorumIndependenceConfig,
+} from "./independence";
+
+export {
+  buildCouncilIndependenceReport,
+  evaluateQuorumIndependence,
+  formatCouncilIndependenceReport,
+  INSTITUTIONAL_INDEPENDENCE_DISCLAIMER,
+  type CouncilIndependenceReport,
+  type CouncilIndependenceSummary,
+  type IndependenceGroupings,
+  type CorrelationCluster,
+  type IndependenceAssumption,
+  type PersonaIndependenceProfile,
+  type QuorumIndependenceEvaluation,
+  type QuorumIndependenceConfig,
+} from "./independence";
 
 /** Claim lifecycle states the quorum gate cares about. */
 export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled" | "paused" | "expired";
@@ -218,8 +238,8 @@ export interface QuorumEvaluation {
   acceptedSlugs: string[];
   /** Valid votes in ballot order (duplicates / rejects excluded). */
   ballot: ClassifiedVote[];
-  /** Explicit inconsistencies where a duplicate vote conflicted with the original accepted vote. */
-  conflicts: DuplicateVoteConflict[];
+  /** Optional operator independence assessment of the decisive ballot. */
+  independence?: QuorumIndependenceEvaluation;
 }
 
 const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
@@ -721,7 +741,12 @@ export interface QuorumEvaluationOptions extends BuildBallotOptions {
 export function evaluateQuorum(
   attempts: ClassifiedVote[],
   quorumRaw: unknown = DEFAULT_COUNCIL_QUORUM,
-  opts?: QuorumEvaluationOptions,
+  opts?: {
+    claimState?: ClaimSettleState;
+    strictConfig?: boolean;
+    checkIndependence?: boolean;
+    independenceConfig?: QuorumIndependenceConfig;
+  },
 ): QuorumEvaluation {
   const claimState = opts?.claimState;
   const quorum = normalizeQuorum(quorumRaw);
@@ -864,6 +889,18 @@ export function evaluateQuorum(
     expired ? `${expired} expired` : null,
   ].filter(Boolean);
 
+  const dep = dispositions.dependency_failure;
+  const paused = dispositions.paused;
+  const reasonParts = [
+    `below quorum: ${decisiveCount} decisive < ${quorum}`,
+    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
+    dispositions.stale ? `${dispositions.stale} stale` : null,
+    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
+    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
+    paused ? `${paused} paused` : null,
+    dep ? `${dep} dependency_failure` : null,
+  ].filter(Boolean);
+
   return {
     action: "fallback_solo",
     quorum,
@@ -874,6 +911,6 @@ export function evaluateQuorum(
     reason: reasonParts.join("; "),
     acceptedSlugs,
     ballot,
-    conflicts,
+    ...(independence ? { independence } : {}),
   };
 }
