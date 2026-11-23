@@ -36,6 +36,7 @@ deploy/contract-artifacts.manifest.json	Pinned Wasm digests for fail-closed prov
 lib/ops/artifact-provenance.ts	Offline SHA-256 artifact provenance verifier
 lib/ops/cache-backup.ts	Offline read-index cache-backup verifier (checksum + privacy, no network)
 lib/ops/dependency-audit.ts	Fail-closed npm audit triage (production high/critical, privacy-safe)
+lib/ops/proposal-triage.ts	Operator proposal backlog triage export (grouped by age & blocking reason, privacy-safe)
 lib/server/read-index-backup.ts	DB-backed read-index dump / verified restore (restore fingerprint check)
 scripts/verify-artifact-provenance.ts	CLI: verify or --write-pins contract artifacts
 scripts/verify-cache-backup.ts	CLI: offline cache-backup verification (npm run verify:cache-backup)
