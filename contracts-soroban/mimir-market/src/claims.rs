@@ -7,10 +7,32 @@ use crate::events;
 use crate::fees;
 use crate::storage;
 use crate::types::{
-    Challenger, Claim, ClaimState, CreateParams, Error, FeeSnapshot, MarketConfig, WinnerSide,
-    BPS_DIVISOR, CHALLENGE_LOCK_SECONDS, DEFAULT_PAYOUT_BPS, MAX_CHALLENGERS, MIN_STAKE,
+    Challenger, Claim, ClaimState, ClaimStatement, CreateParams, Error, FeeSnapshot, MarketConfig,
+    WinnerSide, BPS_DIVISOR, CHALLENGE_LOCK_SECONDS, DEFAULT_PAYOUT_BPS, MAX_CHALLENGERS, MIN_STAKE,
 };
 use crate::util;
+
+/// Export the claim's canonical statement and its v1 digest.
+///
+/// The three exported inputs are the public question, the immutable on-chain
+/// `context_hash` (as `source_commitment`), and the deadline. Settlement never
+/// changes them, so the statement is identical before and after resolution,
+/// challenge, or cancellation. An unknown id fails with `ClaimNotFound`.
+pub fn get_claim_statement(env: &Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+    let claim = storage::get_claim(env, claim_id)?;
+    let digest = util::claim_statement_digest(
+        env,
+        &claim.question,
+        &claim.context_hash,
+        claim.deadline,
+    );
+    Ok(ClaimStatement {
+        question: claim.question,
+        source_commitment: claim.context_hash,
+        deadline: claim.deadline,
+        digest,
+    })
+}
 
 pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result<u64, Error> {
     creator.require_auth();
@@ -353,33 +375,12 @@ pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
         || claim.total_challenger_stake > 0
         || claim.reserved_creator_liability > 0
     {
-        events::CancellationRefused {
-            id: claim_id,
-            challenger_count: claim.challenger_count,
-            total_challenger_stake: claim.total_challenger_stake,
-            reserved_creator_liability: claim.reserved_creator_liability,
-            reason: Error::ClaimHasActiveClaims as u32,
-        }
-        .publish(env);
         return Err(Error::ClaimHasActiveClaims);
-    }
-
-    let usdc = storage::usdc(env)?;
-    let refund = claim.creator_stake;
-    if escrow::balance(env, &usdc) < refund {
-        events::CancellationRefused {
-            id: claim_id,
-            challenger_count: claim.challenger_count,
-            total_challenger_stake: claim.total_challenger_stake,
-            reserved_creator_liability: claim.reserved_creator_liability,
-            reason: Error::RefundNotEscrowed as u32,
-        }
-        .publish(env);
-        return Err(Error::RefundNotEscrowed);
     }
     util::assert_claim_conservation(&claim)?;
 
     let creator = claim.creator.clone();
+    let refund = claim.creator_stake;
     claim.state = ClaimState::Cancelled;
     claim.remaining_escrow = 0;
     storage::set_claim(env, claim_id, &claim);

@@ -10,9 +10,9 @@ use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy,
-    MarketConfig, PayoutPreview, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
-    WinnerSide, MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimStatement, CreateParams, Error, FeePolicy,
+    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict, WinnerSide,
+    MAX_BATCH_SIZE,
 };
 
 #[contract]
@@ -194,6 +194,30 @@ impl MimirMarket {
         storage::get_claim(&env, claim_id)
     }
 
+    /// Canonical statement for independent client verification.
+    ///
+    /// Returns the public question, the immutable `context_hash` as
+    /// `source_commitment`, the deadline, and a v1 SHA-256 digest over exactly
+    /// those inputs. See `util::claim_statement_digest` for the byte encoding.
+    /// The statement is stable for the life of the claim, including after
+    /// challenge, resolution, or cancellation. Unknown ids fail with
+    /// `Error::ClaimNotFound`.
+    pub fn get_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Alias of `get_claim_statement`, named for callers that export a
+    /// statement to an indexer or worker.
+    pub fn export_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Digest-only view for callers that need just the canonical v1 digest
+    /// without marshalling the full statement.
+    pub fn get_claim_statement_digest(env: Env, claim_id: u64) -> Result<BytesN<32>, Error> {
+        Ok(claims::get_claim_statement(&env, claim_id)?.digest)
+    }
+
     /// Paginated list of claim ids created by `creator`, in creation order.
     ///
     /// Returns up to `limit` ids starting at `offset` (0-based) together with
@@ -213,7 +237,8 @@ impl MimirMarket {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        Ok(storage::creator_claims_page(&env, &creator, offset, limit))
+        let (ids, total) = storage::get_creator_claims(&env, &creator, offset, limit);
+        Ok((ids, u32::try_from(total).unwrap_or(u32::MAX)))
     }
 
     /// Preview payout aggregate and completeness for a creator's claim history.
@@ -478,16 +503,12 @@ impl MimirMarket {
         storage::withdrawable(&env, &who)
     }
 
-    pub fn get_withdrawable_batch(
-        env: Env,
-        addrs: Vec<Address>,
-    ) -> Result<Vec<i128>, Error> {
+    /// Batched withdrawable balances, position-stable with `addrs`.
+    ///
+    /// Refuses the whole call with `Error::BatchTooLarge` above
+    /// `MAX_BATCH_SIZE`; unknown addresses return `0` in their slot.
+    pub fn get_withdrawable_batch(env: Env, addrs: Vec<Address>) -> Result<Vec<i128>, Error> {
         storage::get_withdrawable_batch(&env, addrs)
-    }
-
-    #[cfg(test)]
-    pub fn add_withdrawable(env: Env, who: Address, amount: i128) {
-        storage::add_withdrawable(&env, &who, amount);
     }
 
     pub fn get_accrued_fees(env: Env, who: Address) -> i128 {
